@@ -22,8 +22,11 @@ backend/
   requirements.txt
 frontend/
   src/                 React application
+  public/              Static browser runtime configuration
   .env.example         Public Supabase URL and publishable key
   package.json
+Dockerfile             Combined Render production image
+render.yaml            Render Blueprint
 ```
 
 ## Supabase setup
@@ -87,13 +90,3 @@ Backend settings are read from the project-root `.env`:
 Supabase persists lecture records, transcript text and segments, notes, subject folders, private audio files, chat sessions, and chat messages. The pgvector table stores lecture excerpts with owner and lecture IDs; retrieval always filters by both. Audio uploads are limited to 500 MB.
 
 Existing data under the previous local `data/` directory is left untouched, but is not automatically assigned to an account or imported. It has no authenticated owner mapping, so re-upload the recordings or transcripts after signing in. The old local data is not deleted.
-
-## Tests
-
-Run the offline Python tests with:
-
-```powershell
-python -m pytest backend\tests -q
-```
-
-The application runtime needs API keys and a Supabase project. Unit tests that exercise database or auth behavior should mock the Supabase client rather than connect to a real project.

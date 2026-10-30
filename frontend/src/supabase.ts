@@ -1,7 +1,12 @@
 import { createClient } from "@supabase/supabase-js";
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-const supabasePublishableKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY?.trim();
+const supabaseUrl =
+  window.NOTESGRAPH_CONFIG?.supabaseUrl || import.meta.env.VITE_SUPABASE_URL;
+const supabasePublishableKey = (
+  window.NOTESGRAPH_CONFIG?.supabasePublishableKey ||
+  import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+  ""
+).trim();
 
 export const supabaseConfigError = !supabaseUrl
   ? "VITE_SUPABASE_URL is missing from frontend/.env."

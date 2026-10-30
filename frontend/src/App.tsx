@@ -28,7 +28,9 @@ type ChatMessage = {
   status?: "pending" | "complete" | "error";
   sources?: { timestamp?: string; text: string }[];
 };
-const configuredApiUrl = (import.meta.env.VITE_API_URL || "").trim();
+const configuredApiUrl = (
+  window.NOTESGRAPH_CONFIG?.apiUrl || import.meta.env.VITE_API_URL || ""
+).trim();
 const apiBaseError = (() => {
   if (!configuredApiUrl) return "";
   try {
@@ -136,8 +138,10 @@ function App() {
 }
 
 function Brand({ compact = false }: { compact?: boolean }) {
-  return <Link to="/" className="brand-lockup"><span className="brand-mark"><AudioLines size={19} /></span>
-    {!compact && <span>notes<span className="brand-accent">graph</span></span>}</Link>;
+  return <Link to="/" className="brand-lockup" aria-label="NotesGraph home">
+    <span className="brand-mark"><AudioLines size={24} strokeWidth={2.2} /></span>
+    {!compact && <span className="brand-name"><span>Notes</span><span className="brand-accent">Graph</span></span>}
+  </Link>;
 }
 
 function ThemeButton({ theme, toggle }: { theme: ReturnType<typeof useTheme>["theme"]; toggle: () => void }) {

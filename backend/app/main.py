@@ -1,8 +1,10 @@
 """NotesGraph API: authenticated lecture processing and owner-scoped data."""
 import logging
 import mimetypes
+import os
 import re
 import asyncio
+import json
 import sys
 import tempfile
 import time
@@ -355,6 +357,21 @@ def health():
         ),
         "gemini_model": config.GEMINI_MODEL,
     }
+
+
+@app.get("/runtime-config.js", include_in_schema=False)
+def runtime_config():
+    """Expose browser-safe deployment configuration without baking it into the image."""
+    settings = {
+        "supabaseUrl": os.getenv("VITE_SUPABASE_URL", ""),
+        "supabasePublishableKey": os.getenv("VITE_SUPABASE_PUBLISHABLE_KEY", ""),
+        "apiUrl": os.getenv("VITE_API_URL", ""),
+    }
+    return Response(
+        f"window.NOTESGRAPH_CONFIG = {json.dumps(settings)};",
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/lectures")
