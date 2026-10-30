@@ -882,6 +882,36 @@ select:focus-visible {
   font-size: 12px;
   font-weight: 400;
 }
+.password-input-wrap {
+  position: relative;
+}
+.auth-form .password-input-wrap input {
+  padding-right: 44px;
+}
+.password-visibility-toggle {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  display: grid;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  transform: translateY(-50%);
+}
+.password-visibility-toggle:hover {
+  color: var(--ink);
+  background: var(--surface-soft);
+}
+.password-visibility-toggle:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 1px;
+}
 .auth-form input::placeholder,
 .upload-fields input::placeholder,
 .transcript-field textarea::placeholder {

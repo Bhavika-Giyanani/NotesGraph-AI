@@ -1,7 +1,7 @@
 import { type Dispatch, type FormEvent, type ReactNode, type SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDownToLine, ArrowRight, AudioLines, BookOpen, Check, ChevronDown, Clock3,
-  FileAudio2, FileText, FolderClosed, FolderOpen, LayoutDashboard,
+  Eye, EyeOff, FileAudio2, FileText, FolderClosed, FolderOpen, LayoutDashboard,
   LoaderCircle, LogOut, Menu, MessageCircle, Moon, Plus, Search, Send, Sparkles,
   Sun, Trash2, UploadCloud, X,
 } from "lucide-react";
@@ -216,6 +216,7 @@ function SignIn() {
   const [mode, setMode] = useState<"login" | "signup">("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -258,7 +259,12 @@ function SignIn() {
         <div className="auth-tabs"><button className={mode === "login" ? "active" : ""} onClick={() => setMode("login")}>Sign in</button><button className={mode === "signup" ? "active" : ""} onClick={() => setMode("signup")}>Create account</button></div>
         <form onSubmit={submit}>
           <label>Email address<input type="email" autoComplete="email" required value={email} onChange={event => setEmail(event.target.value)} placeholder="you@school.edu" /></label>
-          <label>Password<input type="password" autoComplete={mode === "login" ? "current-password" : "new-password"} minLength={8} required value={password} onChange={event => setPassword(event.target.value)} placeholder="At least 8 characters" /></label>
+          <label>Password<div className="password-input-wrap">
+            <input type={showPassword ? "text" : "password"} autoComplete={mode === "login" ? "current-password" : "new-password"} minLength={8} required value={password} onChange={event => setPassword(event.target.value)} placeholder="At least 8 characters" />
+            <button className="password-visibility-toggle" type="button" aria-label={showPassword ? "Hide password" : "Show password"} aria-pressed={showPassword} onClick={() => setShowPassword(visible => !visible)}>
+              {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+            </button>
+          </div></label>
           {error && <div className="form-alert">{error}</div>}{notice && <div className="form-notice">{notice}</div>}
           <button className="button button-dark auth-submit" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : null}{mode === "login" ? "Sign in" : "Create account"} <ArrowRight size={16} /></button>
         </form>
