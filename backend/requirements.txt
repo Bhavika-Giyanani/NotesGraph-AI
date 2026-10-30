@@ -1,0 +1,13 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+python-dotenv>=1.0
+pydantic>=2.7
+supabase>=2.10
+pydub>=0.25.1
+audioop-lts>=0.2.1; python_version >= "3.13"
+groq>=0.11
+langchain-core>=0.3
+langchain-text-splitters>=0.3
+langchain-google-genai>=2.0
+reportlab>=4.0
