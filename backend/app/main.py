@@ -26,6 +26,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     stream=sys.stdout,
 )
+log.setLevel(logging.INFO)
 
 MAX_UPLOAD_MB = 500
 _processing_tasks: set[asyncio.Task] = set()
@@ -61,13 +62,19 @@ async def log_http_requests(request, call_next):
     except Exception:
         log.exception("HTTP request failed: %s %s", request.method, request.url.path)
         raise
-    log.info(
-        "HTTP %s %s -> %s (%.0f ms)",
+    message = "HTTP %s %s -> %s (%.0f ms)"
+    args = (
         request.method,
         request.url.path,
         response.status_code,
         (time.monotonic() - started) * 1000,
     )
+    if response.status_code >= 500:
+        log.error(message, *args)
+    elif response.status_code >= 400:
+        log.warning(message, *args)
+    else:
+        log.info(message, *args)
     return response
 
 

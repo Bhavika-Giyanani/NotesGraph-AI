@@ -320,14 +320,30 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
 
   useEffect(() => {
     if (!selected || !["queued", "transcribing", "generating_notes", "indexing"].includes(selected.status)) return;
-    const timer = window.setInterval(async () => {
+    let cancelled = false;
+    let timer: number | undefined;
+    let retryDelay = 2500;
+    const poll = async () => {
       try {
         const data = await api<Lecture>(`/lectures/${selected.id}`);
+        retryDelay = 2500;
         setSelected(data); setLectures(current => current.map(item => item.id === data.id ? data : item));
-        if (data.status === "done" || data.status === "error" || data.status === "index_error") await refresh();
-      } catch (reason) { setError((reason as Error).message); }
-    }, 2500);
-    return () => window.clearInterval(timer);
+        setError("");
+        if (data.status === "done" || data.status === "error" || data.status === "index_error") {
+          await refresh();
+          return;
+        }
+      } catch (reason) {
+        setError((reason as Error).message);
+        retryDelay = Math.min(retryDelay * 2, 20_000);
+      }
+      if (!cancelled) timer = window.setTimeout(poll, retryDelay);
+    };
+    timer = window.setTimeout(poll, retryDelay);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, [selected, refresh]);
 
   const filteredLectures = useMemo(() => lectures.filter(item =>
@@ -449,12 +465,10 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
       </div>
     </main>
     <AnimatePresence>{showUpload && <UploadModal onClose={() => setShowUpload(false)} onCreated={lecture => {
-      setShowUpload(false);
       setSelected(lecture);
       setView("notes");
       setError("");
       void refresh().catch(reason => setError((reason as Error).message));
-      void openLecture(lecture.id);
     }} />}</AnimatePresence>
   </div>;
 }
@@ -608,7 +622,7 @@ function ChatView({ lectureId, sessions, active, messages, onCreate, onChoose, s
   </div>;
 }
 
-function UploadModal({ onClose, onCreated }: { onClose: () => void; onCreated: (lecture: Lecture) => void | Promise<void> }) {
+function UploadModal({ onClose, onCreated }: { onClose: () => void; onCreated: (lecture: Lecture) => void }) {
   const [mode, setMode] = useState<"audio" | "transcript">("audio");
   const [file, setFile] = useState<File | null>(null);
   const [title, setTitle] = useState("");
@@ -626,7 +640,11 @@ function UploadModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
     if (mode === "audio" && file) { form.append("file", file); form.append("language", language); }
     else form.append("transcript_text", transcript);
     setBusy(true); setError("");
-    try { await onCreated(await api<Lecture>("/lectures", { method: "POST", body: form })); }
+    try {
+      const lecture = await api<Lecture>("/lectures", { method: "POST", body: form });
+      onClose();
+      onCreated(lecture);
+    }
     catch (reason) { setError((reason as Error).message); setBusy(false); }
   }
   return <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
@@ -643,7 +661,7 @@ function UploadModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
         </div>
         {mode === "audio" && <label className="language-select">Audio language<select value={language} onChange={event => setLanguage(event.target.value)}><option value="">Auto-detect</option><option value="en">English</option><option value="hi">Hindi</option><option value="gu">Gujarati</option></select></label>}
         {error && <div className="form-alert">{error}</div>}
-        <div className="modal-foot"><span><span className="secure-dot" /> Private to your account</span><button className="button button-dark" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={16} />}{busy ? "Starting…" : "Create my notes"} <ArrowRight size={16} /></button></div>
+        <div className="modal-foot"><span><span className="secure-dot" /> Private to your account</span><button className="button button-dark" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={16} />}{busy ? mode === "audio" ? "Uploading…" : "Starting…" : "Create my notes"} <ArrowRight size={16} /></button></div>
       </form>
     </motion.section>
   </motion.div>;
