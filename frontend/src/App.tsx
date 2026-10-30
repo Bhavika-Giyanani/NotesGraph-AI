@@ -79,7 +79,11 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
         : "The backend did not respond in time. Check that FastAPI is running on port 8000.");
     }
     if (reason instanceof TypeError) {
-      throw new Error("Cannot reach the backend. Start FastAPI from the project root with: python -m uvicorn backend.app.main:app --reload --port 8000");
+      const requestUrl = new URL(apiUrl(path), window.location.origin);
+      const isLocal = ["localhost", "127.0.0.1"].includes(window.location.hostname);
+      throw new Error(isLocal
+        ? `Cannot connect to the API at ${requestUrl.origin}. Start FastAPI from the project root with: python -m uvicorn backend.app.main:app --reload --port 8000`
+        : `The API request could not reach ${requestUrl.origin}. Check the service status and request logs in Render.`);
     }
     throw reason;
   }
@@ -89,7 +93,14 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     if (contentType.includes("application/json")) {
       try { detail = (await response.json()).detail || detail; } catch { /* Invalid JSON error body. */ }
     } else if (contentType.includes("text/html")) {
-      detail = "The API returned an HTML page instead of JSON. Check VITE_API_URL and make sure the FastAPI backend is running on port 8000.";
+      detail = `The request to ${new URL(apiUrl(path), window.location.origin).pathname} returned an HTML page instead of an API response. Check the frontend API URL and confirm that the matching backend version is deployed.`;
+    }
+    if (response.status === 404) {
+      const requestPath = new URL(apiUrl(path), window.location.origin).pathname;
+      const isLectureDetail = /^\/api\/lectures\/[^/]+$/.test(requestPath);
+      detail = isLectureDetail
+        ? `Lecture not found at ${requestPath}. It may have been deleted, or it may belong to another account. If it should exist, refresh the library and check that the frontend and backend deployments are up to date.`
+        : `API route or resource not found at ${requestPath}. Confirm that the frontend and backend deployment versions match.`;
     }
     throw new Error(detail);
   }
