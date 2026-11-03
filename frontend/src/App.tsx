@@ -54,6 +54,27 @@ function apiUrl(path: string) {
   return `${apiBase}/api${path}`;
 }
 
+function audioUploadKey(userId: string, file: File) {
+  return [
+    "notesgraph-audio-upload",
+    encodeURIComponent(userId),
+    encodeURIComponent(file.name),
+    file.size,
+    file.lastModified,
+  ].join(":");
+}
+
+function getAudioObjectPath(userId: string, file: File) {
+  const key = audioUploadKey(userId, file);
+  const existingPath = localStorage.getItem(key);
+  if (existingPath?.startsWith(`${userId}/`)) return { key, path: existingPath };
+
+  const extension = file.name.match(/\.[^.]+$/)?.[0].toLowerCase() || "";
+  const path = `${userId}/${crypto.randomUUID()}${extension}`;
+  localStorage.setItem(key, path);
+  return { key, path };
+}
+
 function uploadAudioToStorage(
   file: File,
   objectPath: string,
@@ -71,10 +92,6 @@ function uploadAudioToStorage(
   return new Promise((resolve, reject) => {
     const upload = new Upload(file, {
       endpoint: `${storageUrl.origin}/storage/v1/upload/resumable`,
-      headers: {
-        authorization: `Bearer ${accessToken}`,
-        apikey: supabasePublishableKey,
-      },
       metadata: {
         bucketName: "lecture-audio",
         objectName: objectPath,
@@ -82,17 +99,37 @@ function uploadAudioToStorage(
         cacheControl: "3600",
       },
       chunkSize: 6 * 1024 * 1024,
-      retryDelays: [0, 3000, 5000, 10000, 20000],
+      retryDelays: [0, 3000, 5000, 10000, 20000, 30000, 60000, 120000],
       uploadDataDuringCreation: true,
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        apikey: supabasePublishableKey,
+        "x-upsert": "true",
+      },
+      fingerprint: async () => `notesgraph:${objectPath}:${file.size}:${file.lastModified}`,
       removeFingerprintOnSuccess: true,
-      storeFingerprintForResuming: false,
+      storeFingerprintForResuming: true,
       onProgress: (bytesSent, bytesTotal) => {
         onProgress(Math.round((bytesSent / bytesTotal) * 100));
       },
-      onError: reject,
+      onError: reason => {
+        if (
+          "originalRequest" in reason &&
+          (!reason.originalResponse || reason.originalResponse.getStatus() === 0)
+        ) {
+          reject(new Error(
+            "The audio upload lost its network connection before the server responded. Check your connection and retry; the resumable upload will continue from its last saved chunk.",
+          ));
+          return;
+        }
+        reject(reason);
+      },
       onSuccess: () => resolve(),
     });
-    upload.start();
+    void upload.findPreviousUploads().then(previousUploads => {
+      if (previousUploads.length) upload.resumeFromPreviousUpload(previousUploads[0]);
+      upload.start();
+    }).catch(reject);
   });
 }
 
@@ -738,6 +775,7 @@ function UploadModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
     const form = new FormData();
     form.append("title", title);
     form.append("subject", subject);
+    let pendingAudioKey: string | null = null;
     setBusy(true); setError("");
     try {
       if (mode === "audio" && file) {
@@ -747,17 +785,18 @@ function UploadModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
         if (!data.session?.access_token || !data.session.user.id) {
           throw new Error("Your session expired. Please sign in again.");
         }
-        const extension = file.name.match(/\.[^.]+$/)?.[0].toLowerCase() || "";
-        const objectPath = `${data.session.user.id}/${crypto.randomUUID()}${extension}`;
+        const pendingUpload = getAudioObjectPath(data.session.user.id, file);
+        pendingAudioKey = pendingUpload.key;
         setUploadProgress(0);
-        form.append("storage_path", objectPath);
+        form.append("storage_path", pendingUpload.path);
         form.append("source_filename", file.name);
         form.append("language", language);
-        await uploadAudioToStorage(file, objectPath, data.session.access_token, setUploadProgress);
+        await uploadAudioToStorage(file, pendingUpload.path, data.session.access_token, setUploadProgress);
       } else {
         form.append("transcript_text", transcript);
       }
       const lecture = await api<Lecture>("/lectures", { method: "POST", body: form });
+      if (pendingAudioKey) localStorage.removeItem(pendingAudioKey);
       onClose();
       onCreated(lecture);
     }

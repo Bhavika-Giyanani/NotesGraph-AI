@@ -171,7 +171,14 @@ def process_lecture(
             lecture_id, user_id, status="generating_notes", progress="Writing structured notes", error=""
         )
         try:
-            notes = generate_notes(transcript, meta["title"], meta["subject"])
+            notes = generate_notes(
+                transcript,
+                meta["title"],
+                meta["subject"],
+                lambda message: store.update(
+                    lecture_id, user_id, progress=message
+                ),
+            )
         except Exception as exc:
             raise RuntimeError(f"Note generation failed: {exc}") from exc
         log.info(

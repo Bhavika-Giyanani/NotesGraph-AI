@@ -8,7 +8,7 @@ Turn a lecture recording into structured notes, organize them by subject, and as
 - Owner-scoped lectures, folders, private audio objects, notes, vector retrieval, chat sessions, and messages.
 - Audio transcription with Whisper segment timestamps; answers cite the matching audio time when available.
 - Subject folders are reused per account. Blank titles are generated from the lecture's specific topic.
-- Audio uploads use resumable transfers directly to private Supabase Storage; note processing starts in the background after the upload completes. Temporary embedding outages use bounded retries; if indexing still fails, notes remain available and chat indexing can be retried separately.
+- Audio uploads use resumable transfers directly to private Supabase Storage and can resume from the last saved chunk after a network interruption. Note processing starts in the background after the upload completes. Temporary embedding outages use bounded retries; if indexing still fails, notes remain available and chat indexing can be retried separately.
 - React, TypeScript, Tailwind CSS, Motion animations, and persistent light/dark themes.
 - FastAPI backend with Gemini note generation and Supabase pgvector retrieval.
 
@@ -84,7 +84,7 @@ Backend settings are read from the project-root `.env`:
 | `GROQ_API_KEY` | Whisper audio transcription and fallback note generation when Gemini is temporarily unavailable |
 | `FRONTEND_ORIGINS` | Comma-separated CORS origins; defaults to `http://localhost:5173` |
 | `GEMINI_MODEL` | Defaults to `gemini-2.5-flash` |
-| `GROQ_NOTES_MODEL` | Defaults to `openai/gpt-oss-120b` for structured-note fallback |
+| `GROQ_NOTES_MODEL` | Defaults to `openai/gpt-oss-120b` for chunked structured-note fallback when Gemini is temporarily unavailable; long transcripts can take longer on Groq's free-tier token limits |
 | `EMBEDDING_MODEL` | Defaults to `gemini-embedding-001` (768-dimensional vectors) |
 | `WHISPER_MODEL` | Defaults to `whisper-large-v3-turbo` |
 

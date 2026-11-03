@@ -1,6 +1,8 @@
 """Pipeline 1: full transcript -> structured notes (LangChain structured output)."""
 import json
 import logging
+import re
+from typing import Callable, Optional
 
 from groq import Groq
 from langchain_core.prompts import ChatPromptTemplate
@@ -65,41 +67,48 @@ def _is_transient_provider_error(exc: Exception) -> bool:
     )
 
 
-def _strict_json_schema(schema: dict) -> dict:
-    definitions = schema.get("$defs", {})
-
-    def normalize(node: dict) -> dict:
-        reference = node.get("$ref")
-        if reference:
-            name = reference.rsplit("/", 1)[-1]
-            return normalize(definitions[name])
-
-        normalized = {}
-        for key, value in node.items():
-            if key in {"$defs", "$ref", "title", "default", "required"}:
-                continue
-            if key == "properties":
-                normalized[key] = {
-                    name: normalize(property_schema)
-                    for name, property_schema in value.items()
-                }
-            else:
-                normalized[key] = normalize(value) if isinstance(value, dict) else value
-        if node.get("type") == "object":
-            normalized["required"] = list(node.get("properties", {}))
-            normalized["additionalProperties"] = False
-        return normalized
-
-    return normalize(schema)
+def _split_transcript(transcript: str, max_chars: int = 900) -> list[str]:
+    words = transcript.split()
+    chunks = []
+    current: list[str] = []
+    current_length = 0
+    for word in words:
+        if current and current_length + len(word) + 1 > max_chars:
+            chunks.append(" ".join(current))
+            current = []
+            current_length = 0
+        current.append(word)
+        current_length += len(word) + 1
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
 
 
-def _generate_notes_with_groq(payload: dict) -> Notes:
+def _request_groq_notes(transcript: str, title: str, subject: str) -> Notes:
     messages = [
         {
-            "role": "system" if message.type == "system" else "user",
-            "content": message.content,
-        }
-        for message in _prompt.format_messages(**payload)
+            "role": "system",
+            "content": (
+                "Extract concise, factual lecture notes from this transcript excerpt only. "
+                "Do not invent information. Translate Hindi or Gujarati into clear English and "
+                "retain technical terms in Roman script. Return one JSON object with exactly "
+                "these keys: title (string), subject (string), summary (one concise sentence), "
+                "core_explanations (array of {topic, explanation, key_points}), "
+                "announcements (array of {text, deadline}), "
+                "exam_points (array of {point, kind}, where kind is important_question, "
+                "important_topic, or professor_hint), and off_topic (array of {summary}). "
+                "Use empty arrays when a category is absent. Only include facts present in "
+                "the excerpt; use a concise topic title."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Lecture title: {title or 'unknown'}\n"
+                f"Subject hint: {subject or 'unknown'}\n"
+                f"Transcript excerpt:\n{transcript}"
+            ),
+        },
     ]
 
     def request():
@@ -107,25 +116,91 @@ def _generate_notes_with_groq(payload: dict) -> Notes:
             model=config.GROQ_NOTES_MODEL,
             messages=messages,
             temperature=0.2,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "lecture_notes",
-                    "strict": True,
-                    "schema": _strict_json_schema(Notes.model_json_schema()),
-                },
-            },
+            max_completion_tokens=350,
+            response_format={"type": "json_object"},
         )
 
-    response = with_retry(request, tries=3, base_delay=2.0, max_delay=8.0)
+    response = with_retry(request, tries=5, base_delay=10.0, max_delay=60.0)
     content = response.choices[0].message.content
     if not content:
         raise RuntimeError("Groq returned no structured note content.")
     return Notes.model_validate(json.loads(content))
 
 
-def generate_notes(transcript: str, title: str = "", subject: str = "") -> Notes:
-    payload = {"title": title or "unknown", "subject": subject or "unknown", "transcript": transcript}
+def _generate_groq_chunk(transcript: str, title: str, subject: str) -> list[Notes]:
+    try:
+        return [_request_groq_notes(transcript, title, subject)]
+    except Exception as exc:
+        status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+        if status != 413 and "413" not in str(exc):
+            raise
+
+        words = transcript.split()
+        if len(words) < 40:
+            raise RuntimeError(
+                f"Groq rejected a small transcript excerpt for exceeding its token limit: {exc}"
+            ) from exc
+        midpoint = len(words) // 2
+        log.warning("Groq request exceeded its token limit; splitting transcript excerpt.")
+        return (
+            _generate_groq_chunk(" ".join(words[:midpoint]), title, subject)
+            + _generate_groq_chunk(" ".join(words[midpoint:]), title, subject)
+        )
+
+
+def _generate_notes_with_groq(
+    payload: dict, progress: Optional[Callable[[str], None]] = None
+) -> Notes:
+    chunks = _split_transcript(payload["transcript"])
+    if not chunks:
+        raise RuntimeError("Cannot generate notes from an empty transcript.")
+    results: list[Notes] = []
+    for index, chunk in enumerate(chunks, start=1):
+        message = f"Writing notes with Groq fallback ({index}/{len(chunks)})"
+        log.info("%s using %s", message, config.GROQ_NOTES_MODEL)
+        if progress:
+            progress(message)
+        results.extend(
+            _generate_groq_chunk(chunk, payload["title"], payload["subject"])
+        )
+
+    summary_parts = [re.split(r"(?<=[.!?])\s+", note.summary.strip())[0] for note in results]
+    if len(summary_parts) > 5:
+        selected = [
+            round(index * (len(summary_parts) - 1) / 4)
+            for index in range(5)
+        ]
+        summary_parts = [summary_parts[index] for index in selected]
+
+    def deduplicate(items):
+        unique = {}
+        for item in items:
+            key = json.dumps(item.model_dump(), sort_keys=True, ensure_ascii=False)
+            unique[key] = item
+        return list(unique.values())
+
+    return Notes(
+        title=next((note.title for note in results if note.title.strip()), "Lecture notes"),
+        subject=next((note.subject for note in results if note.subject.strip()), payload["subject"]),
+        summary=" ".join(part for part in summary_parts if part),
+        core_explanations=deduplicate(
+            [item for note in results for item in note.core_explanations]
+        ),
+        announcements=deduplicate(
+            [item for note in results for item in note.announcements]
+        ),
+        exam_points=deduplicate([item for note in results for item in note.exam_points]),
+        off_topic=deduplicate([item for note in results for item in note.off_topic]),
+    )
+
+
+def generate_notes(
+    transcript: str,
+    title: str = "",
+    subject: str = "",
+    progress: Optional[Callable[[str], None]] = None,
+) -> Notes:
+    payload = {"title": title, "subject": subject, "transcript": transcript}
 
     def run() -> Notes:
         chain = _prompt | get_llm(temperature=0.2).with_structured_output(Notes)
@@ -149,7 +224,7 @@ def generate_notes(transcript: str, title: str = "", subject: str = "") -> Notes
             config.GROQ_NOTES_MODEL,
         )
         try:
-            notes = _generate_notes_with_groq(payload)
+            notes = _generate_notes_with_groq(payload, progress)
         except Exception as groq_error:
             raise RuntimeError(
                 f"Gemini model '{config.GEMINI_MODEL}' failed during structured note generation "
