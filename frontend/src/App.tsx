@@ -75,11 +75,41 @@ function getAudioObjectPath(userId: string, file: File) {
   return { key, path };
 }
 
+async function uploadAudioDirect(
+  file: File,
+  objectPath: string,
+  storageOrigin: string,
+  accessToken: string,
+): Promise<void> {
+  const objectUrl = new URL(
+    `/storage/v1/object/lecture-audio/${objectPath.split("/").map(encodeURIComponent).join("/")}`,
+    storageOrigin,
+  );
+  const response = await fetch(objectUrl, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      apikey: supabasePublishableKey,
+      "cache-control": "max-age=3600",
+      "content-type": file.type || "application/octet-stream",
+      "x-upsert": "true",
+    },
+    body: file,
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(
+      `Direct Storage upload failed (${response.status}): ${body || response.statusText}`,
+    );
+  }
+}
+
 function uploadAudioToStorage(
   file: File,
   objectPath: string,
   accessToken: string,
-  onProgress: (percentage: number) => void,
+  fallbackKey: string,
+  onProgress: (percentage: number | null) => void,
 ): Promise<void> {
   if (!supabaseUrl) throw new Error(supabaseConfigError);
   const storageUrl = new URL(supabaseUrl);
@@ -89,7 +119,12 @@ function uploadAudioToStorage(
   ) {
     storageUrl.hostname = `${storageUrl.hostname.slice(0, -".supabase.co".length)}.storage.supabase.co`;
   }
+  if (localStorage.getItem(fallbackKey) === "true") {
+    onProgress(null);
+    return uploadAudioDirect(file, objectPath, storageUrl.origin, accessToken);
+  }
   return new Promise((resolve, reject) => {
+    let networkFailures = 0;
     const upload = new Upload(file, {
       endpoint: `${storageUrl.origin}/storage/v1/upload/resumable`,
       metadata: {
@@ -109,6 +144,14 @@ function uploadAudioToStorage(
       fingerprint: async () => `notesgraph:${objectPath}:${file.size}:${file.lastModified}`,
       removeFingerprintOnSuccess: true,
       storeFingerprintForResuming: true,
+      onShouldRetry: error => {
+        const status = error.originalResponse?.getStatus() || 0;
+        if (status === 0) {
+          networkFailures += 1;
+          return navigator.onLine !== false && networkFailures < 2;
+        }
+        return status === 409 || status === 423 || status < 400 || status >= 500;
+      },
       onProgress: (bytesSent, bytesTotal) => {
         onProgress(Math.round((bytesSent / bytesTotal) * 100));
       },
@@ -117,9 +160,15 @@ function uploadAudioToStorage(
           "originalRequest" in reason &&
           (!reason.originalResponse || reason.originalResponse.getStatus() === 0)
         ) {
-          reject(new Error(
-            "The audio upload lost its network connection before the server responded. Check your connection and retry; the resumable upload will continue from its last saved chunk.",
-          ));
+          localStorage.setItem(fallbackKey, "true");
+          onProgress(null);
+          void uploadAudioDirect(file, objectPath, storageUrl.origin, accessToken)
+            .then(resolve)
+            .catch(fallbackError => {
+              reject(new Error(
+                `Resumable upload lost its network connection, and the direct-upload fallback also failed: ${userFacingError(fallbackError)}`,
+              ));
+            });
           return;
         }
         reject(reason);
@@ -787,16 +836,26 @@ function UploadModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
         }
         const pendingUpload = getAudioObjectPath(data.session.user.id, file);
         pendingAudioKey = pendingUpload.key;
+        const fallbackKey = `${pendingUpload.key}:direct-fallback`;
         setUploadProgress(0);
         form.append("storage_path", pendingUpload.path);
         form.append("source_filename", file.name);
         form.append("language", language);
-        await uploadAudioToStorage(file, pendingUpload.path, data.session.access_token, setUploadProgress);
+        await uploadAudioToStorage(
+          file,
+          pendingUpload.path,
+          data.session.access_token,
+          fallbackKey,
+          setUploadProgress,
+        );
       } else {
         form.append("transcript_text", transcript);
       }
       const lecture = await api<Lecture>("/lectures", { method: "POST", body: form });
-      if (pendingAudioKey) localStorage.removeItem(pendingAudioKey);
+      if (pendingAudioKey) {
+        localStorage.removeItem(pendingAudioKey);
+        localStorage.removeItem(`${pendingAudioKey}:direct-fallback`);
+      }
       onClose();
       onCreated(lecture);
     }
@@ -820,7 +879,7 @@ function UploadModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
         </div>
         {mode === "audio" && <label className="language-select">Audio language<select value={language} onChange={event => setLanguage(event.target.value)}><option value="">Auto-detect</option><option value="en">English</option><option value="hi">Hindi</option><option value="gu">Gujarati</option></select></label>}
         {error && <div className="form-alert">{error}</div>}
-        <div className="modal-foot"><span><span className="secure-dot" /> Private to your account</span><button className="button button-dark" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={16} />}{busy ? mode === "audio" ? `Uploading… ${uploadProgress ?? 0}%` : "Starting…" : "Create my notes"} <ArrowRight size={16} /></button></div>
+        <div className="modal-foot"><span><span className="secure-dot" /> Private to your account</span><button className="button button-dark" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={16} />}{busy ? mode === "audio" ? uploadProgress === null ? "Retrying direct upload…" : `Uploading… ${uploadProgress}%` : "Starting…" : "Create my notes"} <ArrowRight size={16} /></button></div>
       </form>
     </motion.section>
   </motion.div>;
