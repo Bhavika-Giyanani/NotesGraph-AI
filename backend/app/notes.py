@@ -84,7 +84,34 @@ def _split_transcript(transcript: str, max_chars: int = 900) -> list[str]:
     return chunks
 
 
+def _is_groq_json_validation_error(exc: Exception) -> bool:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict) and error.get("code") == "json_validate_failed":
+            return True
+    return "json_validate_failed" in str(exc).lower()
+
+
+def _parse_groq_notes(content: str) -> Notes:
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+    try:
+        return Notes.model_validate(json.loads(text))
+    except json.JSONDecodeError:
+        start = text.find("{")
+        if start >= 0:
+            try:
+                value, _ = json.JSONDecoder().raw_decode(text[start:])
+                return Notes.model_validate(value)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        raise RuntimeError("Groq returned invalid JSON for structured notes.") from None
+
+
 def _request_groq_notes(transcript: str, title: str, subject: str) -> Notes:
+    client = Groq(api_key=config.GROQ_API_KEY)
     messages = [
         {
             "role": "system",
@@ -98,7 +125,8 @@ def _request_groq_notes(transcript: str, title: str, subject: str) -> Notes:
                 "exam_points (array of {point, kind}, where kind is important_question, "
                 "important_topic, or professor_hint), and off_topic (array of {summary}). "
                 "Use empty arrays when a category is absent. Only include facts present in "
-                "the excerpt; use a concise topic title."
+                "the excerpt; use a concise topic title. Keep every field brief, and include "
+                "at most two items per array."
             ),
         },
         {
@@ -111,20 +139,56 @@ def _request_groq_notes(transcript: str, title: str, subject: str) -> Notes:
         },
     ]
 
-    def request():
-        return Groq(api_key=config.GROQ_API_KEY).chat.completions.create(
-            model=config.GROQ_NOTES_MODEL,
-            messages=messages,
-            temperature=0.2,
-            max_completion_tokens=350,
-            response_format={"type": "json_object"},
-        )
+    def request(request_messages, *, json_mode: bool):
+        options = {
+            "model": config.GROQ_NOTES_MODEL,
+            "messages": request_messages,
+            "temperature": 0.2,
+            "max_completion_tokens": 350,
+        }
+        if json_mode:
+            options["response_format"] = {"type": "json_object"}
+        return client.chat.completions.create(**options)
 
-    response = with_retry(request, tries=5, base_delay=10.0, max_delay=60.0)
+    try:
+        response = with_retry(
+            lambda: request(messages, json_mode=True),
+            tries=5,
+            base_delay=10.0,
+            max_delay=60.0,
+        )
+    except Exception as exc:
+        if not _is_groq_json_validation_error(exc):
+            raise
+        log.warning(
+            "Groq JSON mode rejected generated notes; retrying once with a concise JSON-only prompt."
+        )
+        repair_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Return only one valid JSON object, with no markdown or extra text. "
+                    "It must have exactly these fields and types: title string, subject string, "
+                    "summary string, core_explanations array of objects {topic string, "
+                    "explanation string, key_points array of strings}, announcements array of "
+                    "objects {text string, deadline string}, exam_points array of objects "
+                    "{point string, kind string}, and off_topic array of objects {summary string}. "
+                    "Use empty strings and arrays as needed. Keep values very concise. For kind, "
+                    "use only important_question, important_topic, or professor_hint."
+                ),
+            },
+            messages[1],
+        ]
+        response = with_retry(
+            lambda: request(repair_messages, json_mode=False),
+            tries=2,
+            base_delay=2.0,
+            max_delay=4.0,
+        )
     content = response.choices[0].message.content
     if not content:
         raise RuntimeError("Groq returned no structured note content.")
-    return Notes.model_validate(json.loads(content))
+    return _parse_groq_notes(content)
 
 
 def _generate_groq_chunk(transcript: str, title: str, subject: str) -> list[Notes]:

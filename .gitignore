@@ -55,4 +55,6 @@ Thumbs.db
 .idea/
 
 tests
+!backend/tests/
+!backend/tests/**
 DEPLOYMENT.md
