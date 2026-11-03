@@ -61,9 +61,16 @@ function uploadAudioToStorage(
   onProgress: (percentage: number) => void,
 ): Promise<void> {
   if (!supabaseUrl) throw new Error(supabaseConfigError);
+  const storageUrl = new URL(supabaseUrl);
+  if (
+    storageUrl.hostname.endsWith(".supabase.co") &&
+    !storageUrl.hostname.endsWith(".storage.supabase.co")
+  ) {
+    storageUrl.hostname = `${storageUrl.hostname.slice(0, -".supabase.co".length)}.storage.supabase.co`;
+  }
   return new Promise((resolve, reject) => {
     const upload = new Upload(file, {
-      endpoint: `${supabaseUrl}/storage/v1/upload/resumable`,
+      endpoint: `${storageUrl.origin}/storage/v1/upload/resumable`,
       headers: {
         authorization: `Bearer ${accessToken}`,
         apikey: supabasePublishableKey,
@@ -75,7 +82,8 @@ function uploadAudioToStorage(
         cacheControl: "3600",
       },
       chunkSize: 6 * 1024 * 1024,
-      retryDelays: [0, 1000, 3000, 5000, 10000],
+      retryDelays: [0, 3000, 5000, 10000, 20000],
+      uploadDataDuringCreation: true,
       removeFingerprintOnSuccess: true,
       storeFingerprintForResuming: false,
       onProgress: (bytesSent, bytesTotal) => {

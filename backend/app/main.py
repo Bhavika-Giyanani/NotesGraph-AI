@@ -17,6 +17,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import auth, config, store
 from .schemas import ChatRequest
@@ -691,5 +692,21 @@ def delete_lecture(lecture_id: str, user_id: str = Depends(auth.current_user)):
     return Response(status_code=204)
 
 
+class SPAStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if (
+                exc.status_code != 404
+                or scope["path"] == "/api"
+                or scope["path"].startswith("/api/")
+                or scope["path"] == "/runtime-config.js"
+                or Path(path).suffix
+            ):
+                raise
+            return await super().get_response("index.html", scope)
+
+
 if config.FRONTEND_DIST.is_dir():
-    app.mount("/", StaticFiles(directory=config.FRONTEND_DIST, html=True), name="frontend")
+    app.mount("/", SPAStaticFiles(directory=config.FRONTEND_DIST, html=True), name="frontend")
