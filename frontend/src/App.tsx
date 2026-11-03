@@ -277,15 +277,17 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     throw reason;
   }
   const contentType = response.headers.get("content-type") || "";
+  const requestUrl = new URL(apiUrl(path), window.location.origin);
+  const isHtmlResponse = contentType.includes("text/html");
   if (!response.ok) {
     let detail = `Request failed (${response.status})`;
     if (contentType.includes("application/json")) {
       try { detail = (await response.json()).detail || detail; } catch { /* Invalid JSON error body. */ }
-    } else if (contentType.includes("text/html")) {
-      detail = `The request to ${new URL(apiUrl(path), window.location.origin).pathname} returned an HTML page instead of an API response. Check the frontend API URL and confirm that the matching backend version is deployed.`;
+    } else if (isHtmlResponse) {
+      detail = `The API request to ${requestUrl.origin}${requestUrl.pathname} returned an HTML page (HTTP ${response.status}) instead of a FastAPI response. Check that this origin is the backend service. If the frontend and backend are separate, set VITE_API_URL to the backend origin and redeploy the frontend; if they share a Render service, hard-refresh the page and confirm the latest backend deployment is live.`;
     }
-    if (response.status === 404) {
-      const requestPath = new URL(apiUrl(path), window.location.origin).pathname;
+    if (response.status === 404 && !isHtmlResponse) {
+      const requestPath = requestUrl.pathname;
       const isLectureDetail = /^\/api\/lectures\/[^/]+$/.test(requestPath);
       detail = isLectureDetail
         ? `Lecture not found at ${requestPath}. It may have been deleted, or it may belong to another account. If it should exist, refresh the library and check that the frontend and backend deployments are up to date.`
@@ -295,7 +297,7 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   if (response.status === 204) return undefined as T;
   if (!contentType.includes("application/json")) {
-    throw new Error("The API returned a non-JSON response. Check VITE_API_URL and make sure the FastAPI backend is running.");
+    throw new Error(`The API request to ${requestUrl.origin}${requestUrl.pathname} returned a non-JSON response. Check VITE_API_URL and make sure the FastAPI backend is running.`);
   }
   return response.json() as Promise<T>;
 }

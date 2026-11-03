@@ -99,7 +99,7 @@ def _parse_groq_notes(content: str) -> Notes:
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
     try:
         return Notes.model_validate(json.loads(text))
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         start = text.find("{")
         if start >= 0:
             try:
@@ -196,16 +196,28 @@ def _generate_groq_chunk(transcript: str, title: str, subject: str) -> list[Note
         return [_request_groq_notes(transcript, title, subject)]
     except Exception as exc:
         status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
-        if status != 413 and "413" not in str(exc):
+        error_text = str(exc).lower()
+        can_split = (
+            status == 413
+            or "413" in error_text
+            or "json_validate_failed" in error_text
+            or "returned invalid json" in error_text
+        )
+        if not can_split:
             raise
 
         words = transcript.split()
         if len(words) < 40:
+            if "json" in error_text:
+                raise RuntimeError(
+                    "Groq could not produce valid structured JSON for a short transcript excerpt."
+                ) from exc
             raise RuntimeError(
                 f"Groq rejected a small transcript excerpt for exceeding its token limit: {exc}"
             ) from exc
         midpoint = len(words) // 2
-        log.warning("Groq request exceeded its token limit; splitting transcript excerpt.")
+        reason = "structured JSON generation" if "json" in error_text else "token limit"
+        log.warning("Groq failed during %s; splitting transcript excerpt.", reason)
         return (
             _generate_groq_chunk(" ".join(words[:midpoint]), title, subject)
             + _generate_groq_chunk(" ".join(words[midpoint:]), title, subject)

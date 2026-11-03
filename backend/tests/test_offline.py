@@ -486,3 +486,37 @@ def test_groq_json_validation_retries_with_json_only_prompt(monkeypatch):
     assert calls[0]["response_format"] == {"type": "json_object"}
     assert "response_format" not in calls[1]
     assert "Return only one valid JSON object" in calls[1]["messages"][0]["content"]
+
+
+def test_groq_invalid_json_retries_with_smaller_transcript_chunks(monkeypatch):
+    from app import notes
+
+    calls = []
+
+    def request(transcript, title, subject):
+        calls.append(transcript)
+        if len(calls) == 1:
+            raise RuntimeError("Groq returned invalid JSON for structured notes.")
+        return Notes.model_validate(SAMPLE)
+
+    monkeypatch.setattr(notes, "_request_groq_notes", request)
+    results = notes._generate_groq_chunk(" ".join(["lecture"] * 80), "", "")
+
+    assert len(calls) == 3
+    assert len(results) == 2
+    assert all(len(chunk.split()) == 40 for chunk in calls[1:])
+
+
+def test_groq_short_invalid_json_returns_actionable_error(monkeypatch):
+    from app import notes
+
+    def invalid_response(*_):
+        raise RuntimeError("Groq returned invalid JSON for structured notes.")
+
+    monkeypatch.setattr(notes, "_request_groq_notes", invalid_response)
+    try:
+        notes._generate_groq_chunk("A short transcript.", "", "")
+    except RuntimeError as exc:
+        assert "short transcript excerpt" in str(exc)
+    else:
+        raise AssertionError("Expected malformed Groq JSON to be reported.")
