@@ -75,6 +75,8 @@ function getAudioObjectPath(userId: string, file: File) {
   return { key, path };
 }
 
+const TUS_CHUNK_SIZE = 6 * 1024 * 1024;
+
 async function uploadAudioDirect(
   file: File,
   objectPath: string,
@@ -97,9 +99,14 @@ async function uploadAudioDirect(
     body: file,
   });
   if (!response.ok) {
+    if (response.status === 524) {
+      throw new Error(
+        "Supabase Storage timed out while receiving this file (Cloudflare 524). The upload was not confirmed. Retry the same file to resume, and check Supabase service status if this keeps happening.",
+      );
+    }
     const body = await response.text();
     throw new Error(
-      `Direct Storage upload failed (${response.status}): ${body || response.statusText}`,
+      `Direct Storage upload failed (${response.status}): ${body.slice(0, 500) || response.statusText}`,
     );
   }
 }
@@ -119,9 +126,14 @@ function uploadAudioToStorage(
   ) {
     storageUrl.hostname = `${storageUrl.hostname.slice(0, -".supabase.co".length)}.storage.supabase.co`;
   }
-  if (localStorage.getItem(fallbackKey) === "true") {
+  const canUseDirectFallback = file.size < TUS_CHUNK_SIZE;
+  if (!canUseDirectFallback) localStorage.removeItem(fallbackKey);
+  if (canUseDirectFallback && localStorage.getItem(fallbackKey) === "true") {
     onProgress(null);
-    return uploadAudioDirect(file, objectPath, storageUrl.origin, accessToken);
+    return uploadAudioDirect(file, objectPath, storageUrl.origin, accessToken).catch(reason => {
+      localStorage.removeItem(fallbackKey);
+      throw reason;
+    });
   }
   return new Promise((resolve, reject) => {
     let networkFailures = 0;
@@ -133,7 +145,7 @@ function uploadAudioToStorage(
         contentType: file.type || "application/octet-stream",
         cacheControl: "3600",
       },
-      chunkSize: 6 * 1024 * 1024,
+      chunkSize: TUS_CHUNK_SIZE,
       retryDelays: [0, 3000, 5000, 10000, 20000, 30000, 60000, 120000],
       uploadDataDuringCreation: true,
       headers: {
@@ -156,19 +168,32 @@ function uploadAudioToStorage(
         onProgress(Math.round((bytesSent / bytesTotal) * 100));
       },
       onError: reason => {
-        if (
-          "originalRequest" in reason &&
-          (!reason.originalResponse || reason.originalResponse.getStatus() === 0)
-        ) {
+        const status = "originalResponse" in reason
+          ? reason.originalResponse?.getStatus() || 0
+          : 0;
+        if (status === 524) {
+          reject(new Error(
+            "Supabase Storage timed out while receiving an upload chunk (Cloudflare 524). Retry the same file to resume; if this keeps happening, check Supabase service status or contact Supabase support with the request time and Cloudflare Ray ID.",
+          ));
+          return;
+        }
+        if ("originalRequest" in reason && status === 0 && canUseDirectFallback) {
           localStorage.setItem(fallbackKey, "true");
           onProgress(null);
           void uploadAudioDirect(file, objectPath, storageUrl.origin, accessToken)
             .then(resolve)
             .catch(fallbackError => {
+              localStorage.removeItem(fallbackKey);
               reject(new Error(
-                `Resumable upload lost its network connection, and the direct-upload fallback also failed: ${userFacingError(fallbackError)}`,
+                `Resumable upload lost its network connection. The small-file fallback also failed: ${userFacingError(fallbackError)}`,
               ));
             });
+          return;
+        }
+        if ("originalRequest" in reason && status === 0) {
+          reject(new Error(
+            "The connection to Supabase Storage was lost during a chunk upload. The resumable upload is preserved; retry the same file to continue from its last saved chunk. If it keeps failing, check Supabase service status and your network.",
+          ));
           return;
         }
         reject(reason);
