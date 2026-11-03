@@ -81,9 +81,10 @@ Backend settings are read from the project-root `.env`:
 | `SUPABASE_PUBLISHABLE_KEY` | Supabase API key used to validate user access tokens |
 | `SUPABASE_SECRET_KEY` | Server-only database and private storage access |
 | `GOOGLE_API_KEY` | Gemini notes, chat, and embeddings |
-| `GROQ_API_KEY` | Whisper audio transcription |
+| `GROQ_API_KEY` | Whisper audio transcription and fallback note generation when Gemini is temporarily unavailable |
 | `FRONTEND_ORIGINS` | Comma-separated CORS origins; defaults to `http://localhost:5173` |
 | `GEMINI_MODEL` | Defaults to `gemini-2.5-flash` |
+| `GROQ_NOTES_MODEL` | Defaults to `openai/gpt-oss-120b` for structured-note fallback |
 | `EMBEDDING_MODEL` | Defaults to `gemini-embedding-001` (768-dimensional vectors) |
 | `WHISPER_MODEL` | Defaults to `whisper-large-v3-turbo` |
 

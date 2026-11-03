@@ -145,11 +145,16 @@ def process_lecture(
                 raise RuntimeError("Audio file is missing; upload the lecture again.")
             store.update(lecture_id, user_id, status="transcribing", error="")
             log.info("Transcription started for lecture %s", lecture_id)
-            transcript, segments = transcribe_audio_with_segments(
-                audio_path,
-                language,
-                progress=lambda message: store.update(lecture_id, user_id, progress=message),
-            )
+            try:
+                transcript, segments = transcribe_audio_with_segments(
+                    audio_path,
+                    language,
+                    progress=lambda message: store.update(lecture_id, user_id, progress=message),
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Groq Whisper model '{config.WHISPER_MODEL}' failed during transcription: {exc}"
+                ) from exc
             if not transcript.strip():
                 raise RuntimeError("No speech was detected in the audio.")
             store.save_transcript(lecture_id, user_id, transcript, segments)
@@ -165,7 +170,10 @@ def process_lecture(
         store.update(
             lecture_id, user_id, status="generating_notes", progress="Writing structured notes", error=""
         )
-        notes = generate_notes(transcript, meta["title"], meta["subject"])
+        try:
+            notes = generate_notes(transcript, meta["title"], meta["subject"])
+        except Exception as exc:
+            raise RuntimeError(f"Note generation failed: {exc}") from exc
         log.info(
             "Notes generation completed for lecture %s (%.1f s)",
             lecture_id,
@@ -551,9 +559,18 @@ def retry_lecture(
             409,
             "The recording was not saved successfully. Upload the audio again to retry processing.",
         )
-    store.update(lecture_id, user_id, status="queued", progress="Retrying", error="")
+    try:
+        updated = store.update(
+            lecture_id, user_id, status="queued", progress="Retrying", error=""
+        )
+    except Exception as exc:
+        log.exception("Could not queue processing retry for lecture %s", lecture_id)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not queue this lecture for retry: {str(exc)[:300]}",
+        ) from exc
     _schedule_processing(lecture_id, user_id, None, None)
-    return store.get(lecture_id, user_id)
+    return updated
 
 
 @app.post("/api/lectures/{lecture_id}/retry-index", status_code=202)
