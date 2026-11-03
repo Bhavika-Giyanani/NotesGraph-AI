@@ -8,7 +8,7 @@ Turn a lecture recording into structured notes, organize them by subject, and as
 - Owner-scoped lectures, folders, private audio objects, notes, vector retrieval, chat sessions, and messages.
 - Audio transcription with Whisper segment timestamps; answers cite the matching audio time when available.
 - Subject folders are reused per account. Blank titles are generated from the lecture's specific topic.
-- Audio is accepted before remote storage and note processing run in the background. Temporary embedding outages use bounded retries; if indexing still fails, notes remain available and chat indexing can be retried separately.
+- Audio uploads use resumable transfers directly to private Supabase Storage; note processing starts in the background after the upload completes. Temporary embedding outages use bounded retries; if indexing still fails, notes remain available and chat indexing can be retried separately.
 - React, TypeScript, Tailwind CSS, Motion animations, and persistent light/dark themes.
 - FastAPI backend with Gemini note generation and Supabase pgvector retrieval.
 

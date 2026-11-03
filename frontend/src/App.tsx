@@ -7,8 +7,9 @@ import {
 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { Link, Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { Upload } from "tus-js-client";
 import type { Session } from "@supabase/supabase-js";
-import { supabase, supabaseConfigError } from "./supabase";
+import { supabase, supabaseConfigError, supabasePublishableKey, supabaseUrl } from "./supabase";
 
 type Lecture = {
   id: string; title: string; subject: string; folder_id: string | null; source: string;
@@ -53,10 +54,76 @@ function apiUrl(path: string) {
   return `${apiBase}/api${path}`;
 }
 
+function uploadAudioToStorage(
+  file: File,
+  objectPath: string,
+  accessToken: string,
+  onProgress: (percentage: number) => void,
+): Promise<void> {
+  if (!supabaseUrl) throw new Error(supabaseConfigError);
+  return new Promise((resolve, reject) => {
+    const upload = new Upload(file, {
+      endpoint: `${supabaseUrl}/storage/v1/upload/resumable`,
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        apikey: supabasePublishableKey,
+      },
+      metadata: {
+        bucketName: "lecture-audio",
+        objectName: objectPath,
+        contentType: file.type || "application/octet-stream",
+        cacheControl: "3600",
+      },
+      chunkSize: 6 * 1024 * 1024,
+      retryDelays: [0, 1000, 3000, 5000, 10000],
+      removeFingerprintOnSuccess: true,
+      storeFingerprintForResuming: false,
+      onProgress: (bytesSent, bytesTotal) => {
+        onProgress(Math.round((bytesSent / bytesTotal) * 100));
+      },
+      onError: reject,
+      onSuccess: () => resolve(),
+    });
+    upload.start();
+  });
+}
+
+function isAbortError(reason: unknown): boolean {
+  const error = reason as { name?: unknown; message?: unknown; cause?: unknown } | null;
+  const name = typeof error?.name === "string" ? error.name : "";
+  const message = typeof error?.message === "string" ? error.message : typeof reason === "string" ? reason : "";
+  const normalized = `${name} ${message}`.toLowerCase();
+  return name === "AbortError" || name === "TimeoutError" ||
+    normalized.includes("signal is aborted") ||
+    normalized.includes("aborted without any reason") ||
+    normalized.includes("the operation was aborted") ||
+    (!!error?.cause && error.cause !== reason && isAbortError(error.cause));
+}
+
+function userFacingError(reason: unknown, fallback = "The request failed unexpectedly. Please try again."): string {
+  const error = reason as { name?: unknown; message?: unknown; cause?: unknown } | null;
+  if (isAbortError(reason)) {
+    return "The connection was interrupted before the request finished. Please retry. If it keeps happening, refresh the page and check the Render service logs.";
+  }
+  const message = typeof error?.message === "string"
+    ? error.message.trim()
+    : typeof reason === "string" ? reason.trim() : "";
+  if (message) return message;
+  if (error?.cause && error.cause !== reason) return userFacingError(error.cause, fallback);
+  return fallback;
+}
+
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (!supabase) throw new Error(supabaseConfigError);
   if (apiBaseError) throw new Error(apiBaseError);
-  const { data: { session } } = await supabase.auth.getSession();
+  let session;
+  try {
+    const { data, error } = await supabase.auth.getSession();
+    if (error) throw error;
+    session = data.session;
+  } catch (reason) {
+    throw new Error(userFacingError(reason, "Unable to verify your sign-in session. Please sign in again."));
+  }
   if (!session?.access_token) throw new Error("Your session expired. Please sign in again.");
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${session.access_token}`);
@@ -77,6 +144,9 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       throw new Error(init.body instanceof FormData
         ? "The upload request timed out. Check that FastAPI is running and the Supabase Storage bucket is configured, then try again."
         : "The backend did not respond in time. Check that FastAPI is running on port 8000.");
+    }
+    if (isAbortError(reason)) {
+      throw new Error(userFacingError(reason));
     }
     if (reason instanceof TypeError) {
       const requestUrl = new URL(apiUrl(path), window.location.origin);
@@ -251,7 +321,7 @@ function SignIn() {
       }
       navigate("/app");
     } catch (reason) {
-      setError((reason as Error).message || "Unable to reach Supabase Auth.");
+      setError(userFacingError(reason, "Unable to reach Supabase Auth."));
     } finally {
       setBusy(false);
     }
@@ -315,7 +385,7 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
     setLectures(lectureRows); setFolders(folderRows);
     return lectureRows;
   }, []);
-  useEffect(() => { refresh().catch(reason => setError(reason.message)); }, [refresh]);
+  useEffect(() => { refresh().catch(reason => setError(userFacingError(reason))); }, [refresh]);
 
   const openLecture = useCallback(async (lectureId: string) => {
     chatLoadRequest.current += 1;
@@ -325,7 +395,7 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
       setSelected(data);
       const rows = await api<ChatSession[]>(`/chat-sessions?lecture_id=${lectureId}`);
       setSessions(rows);
-    } catch (reason) { setError((reason as Error).message); }
+    } catch (reason) { setError(userFacingError(reason)); }
     finally { setLoading(false); }
   }, []);
 
@@ -345,7 +415,8 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
           return;
         }
       } catch (reason) {
-        setError((reason as Error).message);
+        if (cancelled) return;
+        setError(userFacingError(reason));
         retryDelay = Math.min(retryDelay * 2, 20_000);
       }
       if (!cancelled) timer = window.setTimeout(poll, retryDelay);
@@ -377,7 +448,7 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
       const rows = await api<ChatMessage[]>(`/chat-sessions/${chat.id}/messages`);
       if (requestId === chatLoadRequest.current) setMessages(rows);
     } catch (reason) {
-      if (requestId === chatLoadRequest.current) setError((reason as Error).message);
+      if (requestId === chatLoadRequest.current) setError(userFacingError(reason));
     }
   }
 
@@ -386,27 +457,27 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
     try {
       const chat = await api<ChatSession>(`/lectures/${selected.id}/chat-sessions`, { method: "POST" });
       setSessions(current => [chat, ...current]); setChatSession(chat); setMessages([]); setView("chat");
-    } catch (reason) { setError((reason as Error).message); }
+    } catch (reason) { setError(userFacingError(reason)); }
   }
 
   async function deleteLecture(id: string) {
     if (!window.confirm("Delete this lecture, its notes, and its chat history?")) return;
     try { await api(`/lectures/${id}`, { method: "DELETE" }); setSelected(null); await refresh(); }
-    catch (reason) { setError((reason as Error).message); }
+    catch (reason) { setError(userFacingError(reason)); }
   }
 
   async function retryLecture(id: string) {
     try {
       setSelected(await api<Lecture>(`/lectures/${id}/retry`, { method: "POST" }));
       await refresh();
-    } catch (reason) { setError((reason as Error).message); }
+    } catch (reason) { setError(userFacingError(reason)); }
   }
 
   async function retryIndex(id: string) {
     try {
       setSelected(await api<Lecture>(`/lectures/${id}/retry-index`, { method: "POST" }));
       await refresh();
-    } catch (reason) { setError((reason as Error).message); }
+    } catch (reason) { setError(userFacingError(reason)); }
   }
 
   async function showTranscript() {
@@ -418,7 +489,7 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
       const response = await fetch(apiUrl(`/lectures/${selected.id}/transcript`), { headers: { Authorization: `Bearer ${active?.access_token}` } });
       if (!response.ok) throw new Error("Transcript is not ready yet.");
       setTranscript(await response.text());
-    } catch (reason) { setError((reason as Error).message); }
+    } catch (reason) { setError(userFacingError(reason)); }
   }
 
   async function download(path: string, filename: string) {
@@ -430,7 +501,7 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
       const url = URL.createObjectURL(await response.blob());
       const anchor = document.createElement("a"); anchor.href = url; anchor.download = filename; anchor.click();
       URL.revokeObjectURL(url);
-    } catch (reason) { setError((reason as Error).message); }
+    } catch (reason) { setError(userFacingError(reason)); }
   }
 
   async function signOut() {
@@ -479,7 +550,7 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
       setSelected(lecture);
       setView("notes");
       setError("");
-      void refresh().catch(reason => setError((reason as Error).message));
+      void refresh().catch(reason => setError(userFacingError(reason)));
     }} />}</AnimatePresence>
   </div>;
 }
@@ -560,7 +631,7 @@ function ChatView({ lectureId, sessions, active, messages, onCreate, onChoose, s
         }
       } catch (reason) {
         if (cancelled) return;
-        setError((reason as Error).message);
+        setError(userFacingError(reason));
         timer = window.setTimeout(poll, 4000);
       }
     };
@@ -613,7 +684,7 @@ function ChatView({ lectureId, sessions, active, messages, onCreate, onChoose, s
       setMessages(current => current.map(message => message.id === optimisticReply.id
         ? { ...message, status: "error", content: "The question could not be sent. Please try again." }
         : message));
-      setError((reason as Error).message);
+      setError(userFacingError(reason));
     }
     finally { setSending(false); }
   }
@@ -641,22 +712,52 @@ function UploadModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
   const [transcript, setTranscript] = useState("");
   const [language, setLanguage] = useState("");
   const [busy, setBusy] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [drag, setDrag] = useState(false);
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (mode === "audio" && !file) { setError("Choose an audio file to continue."); return; }
     if (mode === "transcript" && !transcript.trim()) { setError("Paste a transcript to continue."); return; }
-    const form = new FormData(); form.append("title", title); form.append("subject", subject);
-    if (mode === "audio" && file) { form.append("file", file); form.append("language", language); }
-    else form.append("transcript_text", transcript);
+    if (mode === "audio" && file) {
+      const extension = file.name.match(/\.[^.]+$/)?.[0].toLowerCase() || "";
+      if (![".mp3", ".wav", ".m4a", ".mp4", ".aac", ".ogg", ".flac", ".webm", ".opus", ".wma"].includes(extension)) {
+        setError("Unsupported audio type. Use MP3, WAV, M4A, MP4, AAC, OGG, FLAC, WEBM, OPUS, or WMA.");
+        return;
+      }
+      if (file.size > 500 * 1024 * 1024) { setError("Audio files must be 500 MB or smaller."); return; }
+    }
+    const form = new FormData();
+    form.append("title", title);
+    form.append("subject", subject);
     setBusy(true); setError("");
     try {
+      if (mode === "audio" && file) {
+        if (!supabase) throw new Error(supabaseConfigError);
+        const { data, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) throw sessionError;
+        if (!data.session?.access_token || !data.session.user.id) {
+          throw new Error("Your session expired. Please sign in again.");
+        }
+        const extension = file.name.match(/\.[^.]+$/)?.[0].toLowerCase() || "";
+        const objectPath = `${data.session.user.id}/${crypto.randomUUID()}${extension}`;
+        setUploadProgress(0);
+        form.append("storage_path", objectPath);
+        form.append("source_filename", file.name);
+        form.append("language", language);
+        await uploadAudioToStorage(file, objectPath, data.session.access_token, setUploadProgress);
+      } else {
+        form.append("transcript_text", transcript);
+      }
       const lecture = await api<Lecture>("/lectures", { method: "POST", body: form });
       onClose();
       onCreated(lecture);
     }
-    catch (reason) { setError((reason as Error).message); setBusy(false); }
+    catch (reason) {
+      setError(userFacingError(reason));
+      setBusy(false);
+      setUploadProgress(null);
+    }
   }
   return <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
     <motion.section className="upload-modal" initial={{ opacity: 0, y: 18, scale: .98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12 }} transition={{ duration: .2 }}>
@@ -672,7 +773,7 @@ function UploadModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
         </div>
         {mode === "audio" && <label className="language-select">Audio language<select value={language} onChange={event => setLanguage(event.target.value)}><option value="">Auto-detect</option><option value="en">English</option><option value="hi">Hindi</option><option value="gu">Gujarati</option></select></label>}
         {error && <div className="form-alert">{error}</div>}
-        <div className="modal-foot"><span><span className="secure-dot" /> Private to your account</span><button className="button button-dark" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={16} />}{busy ? mode === "audio" ? "Uploading…" : "Starting…" : "Create my notes"} <ArrowRight size={16} /></button></div>
+        <div className="modal-foot"><span><span className="secure-dot" /> Private to your account</span><button className="button button-dark" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={16} />}{busy ? mode === "audio" ? `Uploading… ${uploadProgress ?? 0}%` : "Starting…" : "Create my notes"} <ArrowRight size={16} /></button></div>
       </form>
     </motion.section>
   </motion.div>;

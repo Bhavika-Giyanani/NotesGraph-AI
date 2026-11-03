@@ -8,6 +8,7 @@ import json
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -288,6 +289,29 @@ def _require(lecture_id: str, user_id: str) -> dict:
     return meta
 
 
+def _validate_storage_upload(storage_path: str, source_filename: str, user_id: str) -> str:
+    owner, separator, object_name = storage_path.partition("/")
+    stem, dot, extension = object_name.rpartition(".")
+    if (
+        not separator
+        or owner != user_id
+        or "/" in object_name
+        or "\\" in storage_path
+        or not dot
+        or f".{extension.lower()}" not in config.ALLOWED_AUDIO_EXT
+    ):
+        raise HTTPException(400, "Invalid audio storage path.")
+    try:
+        uuid.UUID(stem)
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid audio storage path.") from exc
+
+    filename = Path(source_filename.replace("\\", "/")).name
+    if not filename or Path(filename).suffix.lower() != f".{extension.lower()}":
+        raise HTTPException(400, "Audio filename does not match the uploaded file.")
+    return filename
+
+
 def _allocate_title(notes: dict, transcript: str, subject: str) -> str:
     topics = notes.get("core_explanations") or []
     topic = str(topics[0].get("topic") or "").strip() if topics else ""
@@ -398,15 +422,31 @@ async def create_lecture(
     title: str = Form(""),
     subject: str = Form(""),
     language: str = Form(""),
+    storage_path: str = Form(""),
+    source_filename: str = Form(""),
     user_id: str = Depends(auth.current_user),
 ):
     """Upload a recording, or paste a transcript, and start processing."""
     transcript_text = transcript_text.strip()
-    if (file is None or not file.filename) and not transcript_text:
+    storage_path = storage_path.strip()
+    if (file is None or not file.filename) and not transcript_text and not storage_path:
         raise HTTPException(400, "Provide an audio file or a transcript.")
 
     audio_path: Optional[Path] = None
-    if file is not None and file.filename:
+    if storage_path:
+        if (file is not None and file.filename) or transcript_text:
+            raise HTTPException(400, "Provide only one audio file or transcript.")
+        filename = _validate_storage_upload(storage_path, source_filename, user_id)
+        try:
+            meta = store.create(user_id, title, subject, filename, audio_path=storage_path)
+        except Exception:
+            log.exception("Could not create lecture record for user %s", user_id)
+            raise HTTPException(
+                status_code=502,
+                detail="The lecture could not be saved. Check the backend console logs and Supabase configuration.",
+            ) from None
+        log.info("Audio stored for user %s: %s", user_id, storage_path)
+    elif file is not None and file.filename:
         extension = Path(file.filename).suffix.lower()
         if extension not in config.ALLOWED_AUDIO_EXT:
             raise HTTPException(

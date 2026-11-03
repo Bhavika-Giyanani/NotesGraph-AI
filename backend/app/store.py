@@ -37,7 +37,13 @@ def ensure_folder(user_id: str, subject: str) -> Optional[dict]:
     return _one(client().table("folders").select("id,name").eq("user_id", user_id).eq("name", name))
 
 
-def create(user_id: str, title: str, subject: str, source: str) -> dict:
+def create(
+    user_id: str,
+    title: str,
+    subject: str,
+    source: str,
+    audio_path: Optional[str] = None,
+) -> dict:
     folder = ensure_folder(user_id, subject)
     row = {
         "id": str(uuid4()),
@@ -47,6 +53,7 @@ def create(user_id: str, title: str, subject: str, source: str) -> dict:
         "subject": subject.strip(),
         "folder_id": folder["id"] if folder else None,
         "source": source,
+        "audio_path": audio_path,
         "status": "queued",
         "progress": "Waiting to start",
         "error": "",
