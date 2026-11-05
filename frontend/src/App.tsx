@@ -6,7 +6,8 @@ import {
   Sun, Trash2, UploadCloud, X,
 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
-import { Link, Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import ReactMarkdown from "react-markdown";
+import { Link, Navigate, Route, Routes, useMatch, useNavigate } from "react-router-dom";
 import { Upload } from "tus-js-client";
 import type { Session } from "@supabase/supabase-js";
 import { supabase, supabaseConfigError, supabasePublishableKey, supabaseUrl } from "./supabase";
@@ -14,6 +15,7 @@ import { supabase, supabaseConfigError, supabasePublishableKey, supabaseUrl } fr
 type Lecture = {
   id: string; title: string; subject: string; folder_id: string | null; source: string;
   status: string; progress: string; error: string; created_at: string; notes?: Notes;
+  audio_path?: string | null;
 };
 type Notes = {
   summary: string;
@@ -52,6 +54,24 @@ const apiBase = configuredApiUrl && !apiBaseError
 function apiUrl(path: string) {
   if (apiBaseError) throw new Error(apiBaseError);
   return `${apiBase}/api${path}`;
+}
+
+function readCache<T>(key: string): T | null {
+  try {
+    const value = localStorage.getItem(key);
+    return value ? JSON.parse(value) as T : null;
+  } catch (reason) {
+    console.warn(`Could not read dashboard cache '${key}'.`, reason);
+    return null;
+  }
+}
+
+function writeCache(key: string, value: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (reason) {
+    console.warn(`Could not update dashboard cache '${key}'.`, reason);
+  }
 }
 
 function audioUploadKey(userId: string, file: File) {
@@ -332,7 +352,7 @@ function App() {
       <Route path="/" element={<Landing theme={theme} />} />
       <Route path="/sign-in" element={session ? <Navigate to="/app" replace /> : <SignIn />} />
       <Route path="/app/*" element={
-        authLoading ? <LoadingScreen /> : session ? <Dashboard session={session} theme={theme} /> : <Navigate to="/sign-in" replace />
+        authLoading ? <LoadingScreen /> : session ? <Dashboard key={session.user.id} session={session} theme={theme} /> : <Navigate to="/sign-in" replace />
       } />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
@@ -482,8 +502,16 @@ function LoadingScreen() {
 
 function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typeof useTheme> }) {
   const navigate = useNavigate();
-  const [lectures, setLectures] = useState<Lecture[]>([]);
-  const [folders, setFolders] = useState<Folder[]>([]);
+  const lectureRoute = useMatch("/app/lectures/:lectureId");
+  const routeLectureId = lectureRoute?.params.lectureId;
+  const lectureCacheKey = `notesgraph-lectures:${session.user.id}`;
+  const folderCacheKey = `notesgraph-folders:${session.user.id}`;
+  const [lectures, setLectures] = useState<Lecture[]>(
+    () => readCache<Lecture[]>(lectureCacheKey) || [],
+  );
+  const [folders, setFolders] = useState<Folder[]>(
+    () => readCache<Folder[]>(folderCacheKey) || [],
+  );
   const [selected, setSelected] = useState<Lecture | null>(null);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [chatSession, setChatSession] = useState<ChatSession | null>(null);
@@ -494,65 +522,153 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
   const [folderFilter, setFolderFilter] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [showUpload, setShowUpload] = useState(false);
+  const [resumeUpload, setResumeUpload] = useState<Lecture | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<Record<string, number | null>>({});
+  const [showSubjectInput, setShowSubjectInput] = useState(false);
+  const [newSubject, setNewSubject] = useState("");
+  const [oldestFirst, setOldestFirst] = useState(false);
   const [mobileMenu, setMobileMenu] = useState(false);
   const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(
+    () => readCache<Lecture[]>(lectureCacheKey) === null,
+  );
+  const [detailLoading, setDetailLoading] = useState(false);
   const userName = session.user.email?.split("@")[0] || "Learner";
 
   const refresh = useCallback(async () => {
     const [lectureRows, folderRows] = await Promise.all([
       api<Lecture[]>("/lectures"), api<Folder[]>("/folders"),
     ]);
-    setLectures(lectureRows); setFolders(folderRows);
+    setLectures(lectureRows);
+    setFolders(folderRows);
+    writeCache(lectureCacheKey, lectureRows);
+    writeCache(folderCacheKey, folderRows);
     return lectureRows;
-  }, []);
-  useEffect(() => { refresh().catch(reason => setError(userFacingError(reason))); }, [refresh]);
-
-  const openLecture = useCallback(async (lectureId: string) => {
-    chatLoadRequest.current += 1;
-    setLoading(true); setError(""); setView("notes"); setChatSession(null); setMessages([]);
-    try {
-      const data = await api<Lecture>(`/lectures/${lectureId}`);
-      setSelected(data);
-      const rows = await api<ChatSession[]>(`/chat-sessions?lecture_id=${lectureId}`);
-      setSessions(rows);
-    } catch (reason) { setError(userFacingError(reason)); }
-    finally { setLoading(false); }
-  }, []);
+  }, [lectureCacheKey, folderCacheKey]);
 
   useEffect(() => {
-    if (!selected || !["queued", "transcribing", "generating_notes", "indexing"].includes(selected.status)) return;
+    let cancelled = false;
+    refresh()
+      .catch(reason => {
+        if (!cancelled) setError(userFacingError(reason));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [refresh]);
+
+  const openLecture = useCallback(async (lectureId: string) => {
+    navigate(`/app/lectures/${lectureId}`);
+  }, [navigate]);
+
+  useEffect(() => {
+    chatLoadRequest.current += 1;
+    setSelected(null);
+    setSessions([]);
+    setChatSession(null);
+    setMessages([]);
+    setView("notes");
+    setError("");
+    if (!routeLectureId) {
+      setDetailLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setDetailLoading(true);
+    const loadLecture = async () => {
+      try {
+        const [data, rows] = await Promise.all([
+          api<Lecture>(`/lectures/${routeLectureId}`),
+          api<ChatSession[]>(`/chat-sessions?lecture_id=${routeLectureId}`),
+        ]);
+        if (cancelled) return;
+        setSelected(data);
+        setSessions(rows);
+      } catch (reason) {
+        if (!cancelled) setError(userFacingError(reason));
+      } finally {
+        if (!cancelled) setDetailLoading(false);
+      }
+    };
+    void loadLecture();
+    return () => {
+      cancelled = true;
+    };
+  }, [routeLectureId]);
+
+  const activeLectureIds = useMemo(
+    () => lectures
+      .filter(item => ["queued", "transcribing", "generating_notes", "indexing"].includes(item.status))
+      .map(item => item.id)
+      .join(","),
+    [lectures],
+  );
+  useEffect(() => {
+    if (!activeLectureIds) return;
     let cancelled = false;
     let timer: number | undefined;
-    let retryDelay = 2500;
+    const ids = activeLectureIds.split(",");
     const poll = async () => {
-      try {
-        const data = await api<Lecture>(`/lectures/${selected.id}`);
-        retryDelay = 2500;
-        setSelected(data); setLectures(current => current.map(item => item.id === data.id ? data : item));
-        setError("");
-        if (data.status === "done" || data.status === "error" || data.status === "index_error") {
-          await refresh();
-          return;
+      const results = await Promise.all(ids.map(async id => {
+        try {
+          return await api<Lecture>(`/lectures/${id}`);
+        } catch (reason) {
+          if (!cancelled) setError(userFacingError(reason));
+          return null;
         }
-      } catch (reason) {
-        if (cancelled) return;
-        setError(userFacingError(reason));
-        retryDelay = Math.min(retryDelay * 2, 20_000);
+      }));
+      if (cancelled) return;
+      const updated = results.filter((item): item is Lecture => item !== null);
+      if (updated.length) {
+        setLectures(current => current.map(item => updated.find(row => row.id === item.id) || item));
+        setSelected(current => current
+          ? updated.find(row => row.id === current.id) || current
+          : current);
+        if (updated.some(item => ["done", "error", "index_error"].includes(item.status))) {
+          try {
+            await refresh();
+          } catch (reason) {
+            if (!cancelled) setError(userFacingError(reason));
+          }
+        }
       }
-      if (!cancelled) timer = window.setTimeout(poll, retryDelay);
+      if (!cancelled) timer = window.setTimeout(poll, 2500);
     };
-    timer = window.setTimeout(poll, retryDelay);
+    timer = window.setTimeout(poll, 1500);
     return () => {
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [selected, refresh]);
+  }, [activeLectureIds, refresh]);
 
-  const filteredLectures = useMemo(() => lectures.filter(item =>
-    (!folderFilter || item.folder_id === folderFilter) &&
-    `${item.title} ${item.subject}`.toLowerCase().includes(query.toLowerCase()),
-  ), [lectures, folderFilter, query]);
+  const filteredLectures = useMemo(() => lectures
+    .filter(item =>
+      (!folderFilter || item.folder_id === folderFilter) &&
+      `${item.title} ${item.subject}`.toLowerCase().includes(query.toLowerCase()),
+    )
+    .sort((left, right) => {
+      const difference = Date.parse(left.created_at) - Date.parse(right.created_at);
+      return oldestFirst ? difference : -difference;
+    }), [lectures, folderFilter, query, oldestFirst]);
+
+  async function createSubject(event: FormEvent) {
+    event.preventDefault();
+    const name = newSubject.trim();
+    if (!name) return;
+    try {
+      await api<Folder>("/folders", {
+        method: "POST",
+        body: JSON.stringify({ name }),
+      });
+      setNewSubject("");
+      setShowSubjectInput(false);
+      await refresh();
+    } catch (reason) {
+      setError(userFacingError(reason));
+    }
+  }
 
   async function chooseChat(chat: ChatSession, loadMessages = true) {
     setChatSession(chat); setView("chat"); setError("");
@@ -583,22 +699,94 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
 
   async function deleteLecture(id: string) {
     if (!window.confirm("Delete this lecture, its notes, and its chat history?")) return;
-    try { await api(`/lectures/${id}`, { method: "DELETE" }); setSelected(null); await refresh(); }
+    try {
+      await api(`/lectures/${id}`, { method: "DELETE" });
+      navigate("/app");
+      await refresh();
+    }
     catch (reason) { setError(userFacingError(reason)); }
   }
 
   async function retryLecture(id: string) {
     try {
-      setSelected(await api<Lecture>(`/lectures/${id}/retry`, { method: "POST" }));
+      const updated = await api<Lecture>(`/lectures/${id}/retry`, { method: "POST" });
+      setSelected(current => current?.id === id ? { ...current, ...updated } : current);
+      setLectures(current => current.map(item => item.id === id ? { ...item, ...updated } : item));
       await refresh();
     } catch (reason) { setError(userFacingError(reason)); }
   }
 
   async function retryIndex(id: string) {
     try {
-      setSelected(await api<Lecture>(`/lectures/${id}/retry-index`, { method: "POST" }));
+      const updated = await api<Lecture>(`/lectures/${id}/retry-index`, { method: "POST" });
+      setSelected(current => current?.id === id ? { ...current, ...updated } : current);
+      setLectures(current => current.map(item => item.id === id ? { ...item, ...updated } : item));
       await refresh();
     } catch (reason) { setError(userFacingError(reason)); }
+  }
+
+  function onLectureCreated(lecture: Lecture, uploadPending: boolean) {
+    setShowUpload(false);
+    setResumeUpload(null);
+    navigate("/app");
+    setLectures(current => [lecture, ...current.filter(item => item.id !== lecture.id)]);
+    if (uploadPending) {
+      setUploadProgress(current => ({ ...current, [lecture.id]: 0 }));
+    }
+    setError("");
+    void refresh().catch(reason => setError(userFacingError(reason)));
+  }
+
+  function onUploadProgress(lectureId: string, percentage: number | null) {
+    setUploadProgress(current => ({ ...current, [lectureId]: percentage }));
+  }
+
+  function onUploadComplete(lecture: Lecture) {
+    setUploadProgress(current => {
+      const next = { ...current };
+      delete next[lecture.id];
+      return next;
+    });
+    setLectures(current => current.map(item => item.id === lecture.id ? lecture : item));
+    setSelected(current => current?.id === lecture.id ? { ...current, ...lecture } : current);
+    void refresh().catch(reason => setError(userFacingError(reason)));
+  }
+
+  function onUploadFailed(lectureId: string, message: string) {
+    setUploadProgress(current => {
+      const next = { ...current };
+      delete next[lectureId];
+      return next;
+    });
+    void (async () => {
+      try {
+        const failed = await api<Lecture>(`/lectures/${lectureId}/upload-failed`, {
+          method: "POST",
+          body: JSON.stringify({ error: message }),
+        });
+        setLectures(current => current.map(item => item.id === lectureId ? failed : item));
+        setSelected(current => current?.id === lectureId ? { ...current, ...failed } : current);
+        setError(message);
+      } catch (reason) {
+        try {
+          const current = await api<Lecture>(`/lectures/${lectureId}`);
+          setLectures(rows => rows.map(item => item.id === lectureId ? current : item));
+          setSelected(lecture => lecture?.id === lectureId ? { ...lecture, ...current } : lecture);
+          if (["queued", "transcribing", "generating_notes", "indexing", "done", "index_error"].includes(current.status)) {
+            return;
+          }
+        } catch (refreshReason) {
+          setError(userFacingError(refreshReason, "The upload failed and its status could not be saved."));
+          return;
+        }
+        setError(userFacingError(reason, "The upload failed and its status could not be saved."));
+      }
+    })();
+  }
+
+  function resumeAudioUpload(lecture: Lecture) {
+    setResumeUpload(lecture);
+    setShowUpload(true);
   }
 
   async function showTranscript() {
@@ -626,17 +814,23 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
   }
 
   async function signOut() {
+    localStorage.removeItem(lectureCacheKey);
+    localStorage.removeItem(folderCacheKey);
     await supabase?.auth.signOut(); navigate("/");
   }
 
   return <div className="workspace">
     <aside className={`sidebar ${mobileMenu ? "sidebar-open" : ""}`}>
       <div className="sidebar-head"><Brand /><button className="icon-btn mobile-close" onClick={() => setMobileMenu(false)}><X size={18} /></button></div>
-      <button className="new-lecture" onClick={() => setShowUpload(true)}><Plus size={18} /> New lecture <span>⌘ K</span></button>
+      <button className="new-lecture" onClick={() => { setResumeUpload(null); setShowUpload(true); }}><Plus size={18} /> New lecture <span>⌘ K</span></button>
       <nav className="side-nav">
-        <button className={!folderFilter ? "side-link selected" : "side-link"} onClick={() => { setFolderFilter(null); setSelected(null); }}><LayoutDashboard size={17} /> All lectures <span>{lectures.length}</span></button>
-        <div className="side-label">YOUR SUBJECTS <button title="Create folder when adding a subject"><Plus size={14} /></button></div>
-        {folders.map(folder => <button key={folder.id} className={folderFilter === folder.id ? "side-link selected" : "side-link"} onClick={() => { setFolderFilter(folder.id); setSelected(null); }}><FolderClosed size={16} />{folder.name}<span>{lectures.filter(item => item.folder_id === folder.id).length}</span></button>)}
+        <button className={!folderFilter ? "side-link selected" : "side-link"} onClick={() => { setFolderFilter(null); navigate("/app"); }}><LayoutDashboard size={17} /> All lectures <span>{lectures.length}</span></button>
+        <div className="side-label">YOUR SUBJECTS <button type="button" title="Create a subject" aria-label="Create a subject" onClick={() => setShowSubjectInput(value => !value)}><Plus size={14} /></button></div>
+        {showSubjectInput && <form className="subject-create" onSubmit={createSubject}>
+          <input autoFocus value={newSubject} onChange={event => setNewSubject(event.target.value)} placeholder="Subject name" aria-label="Subject name" maxLength={100} />
+          <button type="submit" disabled={!newSubject.trim()} aria-label="Save subject"><Check size={15} /></button>
+        </form>}
+        {folders.map(folder => <button key={folder.id} className={folderFilter === folder.id ? "side-link selected" : "side-link"} onClick={() => { setFolderFilter(folder.id); navigate("/app"); }}><FolderClosed size={16} />{folder.name}<span>{lectures.filter(item => item.folder_id === folder.id).length}</span></button>)}
       </nav>
       <div className="sidebar-bottom">
         <div className="private-card"><span className="private-icon"><Sparkles size={16} /></span><div><b>Your private library</b><small>Only you can see your content.</small></div></div>
@@ -651,34 +845,37 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
       </header>
       <div className="work-content">
         {error && <div className="error-banner"><span>{error}</span><button onClick={() => setError("")}><X size={15} /></button></div>}
-        {!selected ? <section className="library-view">
+        {routeLectureId && !selected && detailLoading ? <div className="empty-state"><LoaderCircle className="spin" /></div> : !selected ? <section className="library-view">
           <div className="welcome-row"><div><span className="eyebrow">YOUR LEARNING SPACE</span><h1>{folderFilter ? folders.find(folder => folder.id === folderFilter)?.name : `Good to see you, ${userName}`}</h1><p>{folderFilter ? "Your course notes and lecture recordings in one place." : "Pick up where you left off, or make something new."}</p></div>
-            <button className="button button-dark" onClick={() => setShowUpload(true)}><Plus size={17} /> Add a lecture</button></div>
-          <div className="library-toolbar"><div className="searchbox"><Search size={16} /><input placeholder="Search lectures..." value={query} onChange={event => setQuery(event.target.value)} /></div><button className="sort-button">Recently added <ChevronDown size={15} /></button></div>
+            <button className="button button-dark" onClick={() => { setResumeUpload(null); setShowUpload(true); }}><Plus size={17} /> Add a lecture</button></div>
+          <div className="library-toolbar"><div className="searchbox"><Search size={16} /><input placeholder="Search lectures..." value={query} onChange={event => setQuery(event.target.value)} /></div><button className="sort-button" onClick={() => setOldestFirst(value => !value)} aria-label="Change lecture sorting">{oldestFirst ? "Oldest first" : "Recently added"} <ChevronDown size={15} /></button></div>
           {loading ? <div className="empty-state"><LoaderCircle className="spin" /></div> : filteredLectures.length ? <div className="lecture-grid">
             {filteredLectures.map((lecture, index) => <motion.button key={lecture.id} className="library-card" onClick={() => openLecture(lecture.id)} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: Math.min(index * .04, .25) }}>
               <span className={`course-cover cover-${index % 4}`}><AudioLines size={24} /><span>{lecture.subject || "LECTURE"}</span></span>
               <span className="library-card-info"><b>{lecture.title}</b><small><span>{lecture.subject || "Uncategorized"}</span><span>·</span><span>{new Date(lecture.created_at).toLocaleDateString()}</span></small>
-                <span className={`status-chip ${lecture.status === "done" || lecture.status === "index_error" ? "ready" : lecture.status === "error" ? "failed" : "processing"}`}><i />{lecture.status === "done" ? "Notes ready" : lecture.status === "index_error" ? "Notes ready · chat needs retry" : lecture.status === "error" ? "Needs attention" : lecture.progress || "Processing"}</span>
+                <span className={`status-chip ${lecture.status === "done" || lecture.status === "index_error" ? "ready" : lecture.status === "error" || lecture.status === "upload_error" ? "failed" : "processing"}`}><i />{lecture.status === "done" ? "Notes ready" : lecture.status === "index_error" ? "Notes ready · chat needs retry" : lecture.status === "error" || lecture.status === "upload_error" ? "Needs attention" : lecture.status === "uploading" && uploadProgress[lecture.id] !== undefined ? `Uploading audio${uploadProgress[lecture.id] === null ? "…" : ` · ${uploadProgress[lecture.id]}%`}` : lecture.status === "uploading" ? "Upload interrupted · open to resume" : lecture.progress || "Processing"}</span>
               </span><ArrowRight className="card-arrow" size={17} /></motion.button>)}
-          </div> : <div className="empty-library"><div className="empty-art"><BookOpen size={27} /><Sparkles size={16} /></div><h3>{query ? "No lectures found" : "Your first lecture starts here"}</h3><p>{query ? "Try another search." : "Add a recording or paste a transcript to create your first set of notes."}</p>{!query && <button className="button button-dark" onClick={() => setShowUpload(true)}><Plus size={17} /> Add your first lecture</button>}</div>}
+          </div> : <div className="empty-library"><div className="empty-art"><BookOpen size={27} /><Sparkles size={16} /></div><h3>{query ? "No lectures found" : "Your first lecture starts here"}</h3><p>{query ? "Try another search." : "Add a recording or paste a transcript to create your first set of notes."}</p>{!query && <button className="button button-dark" onClick={() => { setResumeUpload(null); setShowUpload(true); }}><Plus size={17} /> Add your first lecture</button>}</div>}
           <div className="library-footnote"><span><Check size={14} /> Private to your account</span><span>{lectures.length} {lectures.length === 1 ? "lecture" : "lectures"} saved</span></div>
-        </section> : <LectureView lecture={selected} view={view} setView={setView} onBack={() => setSelected(null)} onDelete={() => deleteLecture(selected.id)} onRetry={() => retryLecture(selected.id)} onRetryIndex={() => retryIndex(selected.id)} onDownload={download}
+        </section> : <LectureView lecture={selected} view={view} setView={setView} onBack={() => navigate("/app")} onDelete={() => deleteLecture(selected.id)} onRetry={() => retryLecture(selected.id)} onRetryIndex={() => retryIndex(selected.id)} onResumeUpload={() => resumeAudioUpload(selected)} uploadingAudio={uploadProgress[selected.id] !== undefined} onDownload={download}
           sessions={sessions} chatSession={chatSession} messages={messages} onCreateChat={createChat} onChooseChat={chooseChat} setMessages={setMessages} transcript={transcript} onTranscript={showTranscript} />}
       </div>
     </main>
-    <AnimatePresence>{showUpload && <UploadModal onClose={() => setShowUpload(false)} onCreated={lecture => {
-      setSelected(lecture);
-      setView("notes");
-      setError("");
-      void refresh().catch(reason => setError(userFacingError(reason)));
-    }} />}</AnimatePresence>
+    <AnimatePresence>{showUpload && <UploadModal
+      onClose={() => setShowUpload(false)}
+      resumeLecture={resumeUpload || undefined}
+      onCreated={onLectureCreated}
+      onUploadProgress={onUploadProgress}
+      onUploadComplete={onUploadComplete}
+      onUploadFailed={onUploadFailed}
+    />}</AnimatePresence>
   </div>;
 }
 
-function LectureView({ lecture, view, setView, onBack, onDelete, onRetry, onRetryIndex, onDownload, sessions, chatSession: active, messages, onCreateChat: onCreate, onChooseChat: onChoose, setMessages, transcript, onTranscript }: {
+function LectureView({ lecture, view, setView, onBack, onDelete, onRetry, onRetryIndex, onResumeUpload, uploadingAudio, onDownload, sessions, chatSession: active, messages, onCreateChat: onCreate, onChooseChat: onChoose, setMessages, transcript, onTranscript }: {
   lecture: Lecture; view: "notes" | "chat" | "transcript"; setView: (view: "notes" | "chat" | "transcript") => void;
   onBack: () => void; onRetry: () => void; onRetryIndex: () => void;
+  onResumeUpload: () => void; uploadingAudio: boolean;
   onDelete: () => void; onDownload: (path: string, filename: string) => void; sessions: ChatSession[];
   chatSession: ChatSession | null; messages: ChatMessage[]; onCreateChat: () => void;
   onChooseChat: (session: ChatSession, loadMessages?: boolean) => void;
@@ -691,10 +888,11 @@ function LectureView({ lecture, view, setView, onBack, onDelete, onRetry, onRetr
       <div className="detail-actions">{(lecture.status === "done" || lecture.status === "index_error") && <><button className="button button-outline" onClick={() => onDownload(`/lectures/${lecture.id}/notes.pdf`, `${lecture.title}.pdf`)}><ArrowDownToLine size={16} /> PDF</button><button className="button button-outline" onClick={() => onDownload(`/lectures/${lecture.id}/notes.md`, `${lecture.title}.md`)}><ArrowDownToLine size={16} /> Markdown</button></>}
         {lecture.status === "error" && <button className="button button-outline" onClick={onRetry}>Retry processing</button>}
         {lecture.status === "index_error" && <button className="button button-outline" onClick={onRetryIndex}>Retry chat indexing</button>}
-        {(lecture.status === "done" || lecture.status === "error" || lecture.status === "index_error") && <button className="icon-btn danger-icon" title="Delete lecture" onClick={onDelete}><Trash2 size={17} /></button>}</div>
+        {(lecture.status === "uploading" || lecture.status === "upload_error") && lecture.audio_path && !uploadingAudio && <button className="button button-outline" onClick={onResumeUpload}>Resume audio upload</button>}
+        {(lecture.status === "done" || lecture.status === "error" || lecture.status === "upload_error" || lecture.status === "index_error") && <button className="icon-btn danger-icon" title="Delete lecture" onClick={onDelete}><Trash2 size={17} /></button>}</div>
     </div>
-    {lecture.status !== "done" && lecture.status !== "index_error" && <div className={`process-banner ${lecture.status === "error" ? "process-error" : ""}`}>
-      {lecture.status === "error" ? <span>{lecture.error || "Something went wrong while processing."}</span> : <><LoaderCircle className="spin" size={18} /><div><b>{lecture.progress || "Getting your notes ready"}</b><small>Leave this page open or come back soon.</small></div></>}
+    {lecture.status !== "done" && lecture.status !== "index_error" && <div className={`process-banner ${lecture.status === "error" || lecture.status === "upload_error" ? "process-error" : ""}`}>
+      {lecture.status === "error" || lecture.status === "upload_error" ? <span>{lecture.error || "Something went wrong while processing."}</span> : <><LoaderCircle className="spin" size={18} /><div><b>{lecture.progress || "Getting your notes ready"}</b><small>{lecture.status === "uploading" ? "The recording upload can be resumed from here after a refresh." : "You can leave this page; processing continues in the background."}</small></div></>}
     </div>}
     {lecture.status === "index_error" && <div className="process-banner process-error">{lecture.error || "Your notes are ready. Chat indexing can be retried without regenerating them."}</div>}
     {(lecture.status === "done" || lecture.status === "index_error") && <div className="detail-layout">
@@ -816,7 +1014,7 @@ function ChatView({ lectureId, sessions, active, messages, onCreate, onChoose, s
     {showHistory && <div className="chat-history-dropdown">{sessions.map(chat => <button key={chat.id} onClick={() => { onChoose(chat); setShowHistory(false); }}><MessageCircle size={15} />{chat.title}</button>)}</div>}
     <div className="chat-messages">
       {!messages.length && <div className="chat-welcome"><span><Sparkles size={20} /></span><h3>Your lecture, on demand.</h3><p>Ask a question and I’ll point you to the relevant moment in the recording.</p><div className="prompt-suggestions">{["What should I focus on for the exam?", "Explain the main idea simply", "Where does the lecture discuss its key example?"].map(text => <button key={text} onClick={() => setQuestion(text)}>{text} <ArrowRight size={14} /></button>)}</div></div>}
-      {messages.map(message => <div key={message.id} className={`chat-message ${message.role}`}><span className="message-avatar">{message.role === "assistant" ? <Sparkles size={15} /> : "Y"}</span><div className={`message-content ${message.status === "error" ? "message-failed" : ""}`}>{message.status === "pending" ? <div className="thinking"><span /><span /><span /></div> : <p>{message.content}</p>}{message.sources?.some(source => source.timestamp) && <div className="source-list"><span>IN THE RECORDING</span>{message.sources.filter(source => source.timestamp).map((source, index) => <span className="source-chip" key={`${source.timestamp}-${index}`} title={source.text}><Clock3 size={13} /> {source.timestamp}</span>)}</div>}</div></div>)}
+      {messages.map(message => <div key={message.id} className={`chat-message ${message.role}`}><span className="message-avatar">{message.role === "assistant" ? <Sparkles size={15} /> : "Y"}</span><div className={`message-content ${message.status === "error" ? "message-failed" : ""}`}>{message.status === "pending" ? <div className="thinking"><span /><span /><span /></div> : message.role === "assistant" ? <ReactMarkdown>{message.content}</ReactMarkdown> : <p>{message.content}</p>}{message.sources?.some(source => source.timestamp) && <div className="source-list"><span>IN THE RECORDING</span>{message.sources.filter(source => source.timestamp).map((source, index) => <span className="source-chip" key={`${source.timestamp}-${index}`} title={source.text}><Clock3 size={13} /> {source.timestamp}</span>)}</div>}</div></div>)}
     </div>
     {error && <div className="chat-error">{error}</div>}
     <form className="chat-composer" onSubmit={submit}><textarea value={question} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder="Ask a question about this lecture…" rows={1} />
@@ -825,15 +1023,28 @@ function ChatView({ lectureId, sessions, active, messages, onCreate, onChoose, s
   </div>;
 }
 
-function UploadModal({ onClose, onCreated }: { onClose: () => void; onCreated: (lecture: Lecture) => void }) {
+function UploadModal({
+  onClose,
+  resumeLecture,
+  onCreated,
+  onUploadProgress,
+  onUploadComplete,
+  onUploadFailed,
+}: {
+  onClose: () => void;
+  resumeLecture?: Lecture;
+  onCreated: (lecture: Lecture, uploadPending: boolean) => void;
+  onUploadProgress: (lectureId: string, percentage: number | null) => void;
+  onUploadComplete: (lecture: Lecture) => void;
+  onUploadFailed: (lectureId: string, message: string) => void;
+}) {
   const [mode, setMode] = useState<"audio" | "transcript">("audio");
   const [file, setFile] = useState<File | null>(null);
   const [title, setTitle] = useState("");
-  const [subject, setSubject] = useState("");
+  const [subject, setSubject] = useState(resumeLecture?.subject || "");
   const [transcript, setTranscript] = useState("");
   const [language, setLanguage] = useState("");
   const [busy, setBusy] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [drag, setDrag] = useState(false);
   async function submit(event: FormEvent) {
@@ -851,8 +1062,9 @@ function UploadModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
     const form = new FormData();
     form.append("title", title);
     form.append("subject", subject);
-    let pendingAudioKey: string | null = null;
     setBusy(true); setError("");
+    let lecture: Lecture | null = null;
+    let pendingAudioKey: string | null = null;
     try {
       if (mode === "audio" && file) {
         if (!supabase) throw new Error(supabaseConfigError);
@@ -864,49 +1076,66 @@ function UploadModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
         const pendingUpload = getAudioObjectPath(data.session.user.id, file);
         pendingAudioKey = pendingUpload.key;
         const fallbackKey = `${pendingUpload.key}:direct-fallback`;
-        setUploadProgress(0);
-        form.append("storage_path", pendingUpload.path);
-        form.append("source_filename", file.name);
-        form.append("language", language);
+        const objectPath = resumeLecture?.audio_path || pendingUpload.path;
+        if (resumeLecture && !objectPath.startsWith(`${data.session.user.id}/`)) {
+          throw new Error("This upload belongs to a different account. Sign in to the account that started it.");
+        }
+        localStorage.setItem(pendingUpload.key, objectPath);
+        if (!resumeLecture) {
+          form.append("storage_path", objectPath);
+          form.append("source_filename", file.name);
+          form.append("language", language);
+          form.append("defer_processing", "true");
+          lecture = await api<Lecture>("/lectures", { method: "POST", body: form });
+          onCreated(lecture, true);
+        } else {
+          lecture = resumeLecture;
+        }
+        onUploadProgress(lecture.id, 0);
+        onClose();
         await uploadAudioToStorage(
           file,
-          pendingUpload.path,
+          objectPath,
           data.session.access_token,
           fallbackKey,
-          setUploadProgress,
+          percentage => onUploadProgress(lecture!.id, percentage),
         );
+        const started = await api<Lecture>(`/lectures/${lecture.id}/start-upload`, { method: "POST" });
+        localStorage.removeItem(pendingAudioKey);
+        localStorage.removeItem(`${pendingAudioKey}:direct-fallback`);
+        onUploadComplete(started);
+        return;
       } else {
         form.append("transcript_text", transcript);
       }
-      const lecture = await api<Lecture>("/lectures", { method: "POST", body: form });
-      if (pendingAudioKey) {
-        localStorage.removeItem(pendingAudioKey);
-        localStorage.removeItem(`${pendingAudioKey}:direct-fallback`);
-      }
+      lecture = await api<Lecture>("/lectures", { method: "POST", body: form });
+      onCreated(lecture, false);
       onClose();
-      onCreated(lecture);
     }
     catch (reason) {
+      if (lecture) {
+        onUploadFailed(lecture.id, userFacingError(reason));
+        return;
+      }
       setError(userFacingError(reason));
       setBusy(false);
-      setUploadProgress(null);
     }
   }
-  return <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
+  return <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={event => { if (!busy && event.target === event.currentTarget) onClose(); }}>
     <motion.section className="upload-modal" initial={{ opacity: 0, y: 18, scale: .98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12 }} transition={{ duration: .2 }}>
-      <div className="modal-head"><div><span className="eyebrow">A NEW CLASS, MADE CLEAR</span><h2>Add a lecture</h2><p>Upload an audio recording or bring in a transcript.</p></div><button className="icon-btn" onClick={onClose}><X size={19} /></button></div>
-      <div className="upload-tabs"><button type="button" className={mode === "audio" ? "active" : ""} onClick={() => setMode("audio")}><FileAudio2 size={16} /> Audio recording</button><button type="button" className={mode === "transcript" ? "active" : ""} onClick={() => setMode("transcript")}><FileText size={16} /> Paste transcript</button></div>
+      <div className="modal-head"><div><span className="eyebrow">{resumeLecture ? "CONTINUE YOUR UPLOAD" : "A NEW CLASS, MADE CLEAR"}</span><h2>{resumeLecture ? "Resume audio upload" : "Add a lecture"}</h2><p>{resumeLecture ? "Choose the same recording to resume its secure upload." : "Upload an audio recording or bring in a transcript."}</p></div><button className="icon-btn" disabled={busy} onClick={onClose}><X size={19} /></button></div>
+      {!resumeLecture && <div className="upload-tabs"><button type="button" className={mode === "audio" ? "active" : ""} onClick={() => setMode("audio")}><FileAudio2 size={16} /> Audio recording</button><button type="button" className={mode === "transcript" ? "active" : ""} onClick={() => setMode("transcript")}><FileText size={16} /> Paste transcript</button></div>}
       <form onSubmit={submit}>
         {mode === "audio" ? <label className={`drop-zone ${drag ? "dragging" : ""}`} onDragOver={event => { event.preventDefault(); setDrag(true); }} onDragLeave={() => setDrag(false)} onDrop={event => { event.preventDefault(); setDrag(false); setFile(event.dataTransfer.files[0] || null); }}>
           <input type="file" accept=".mp3,.wav,.m4a,.mp4,.aac,.ogg,.flac,.webm,.opus,.wma,audio/*" onChange={event => setFile(event.target.files?.[0] || null)} />
           <span className="upload-icon"><UploadCloud size={21} /></span><b>{file ? file.name : "Drop your audio here"}</b><span>{file ? `${(file.size / (1024 * 1024)).toFixed(1)} MB · Ready to upload` : "or click to browse · MP3, WAV, M4A and more"}</span>
         </label> : <label className="transcript-field"><span>Paste your lecture transcript</span><textarea rows={7} value={transcript} onChange={event => setTranscript(event.target.value)} placeholder="Paste your transcript here…" /></label>}
-        <div className="upload-fields"><label>Title <small>Optional</small><input value={title} onChange={event => setTitle(event.target.value)} placeholder="We’ll create one from your lecture" /></label>
+        {!resumeLecture && <div className="upload-fields"><label>Title <small>Optional</small><input value={title} onChange={event => setTitle(event.target.value)} placeholder="We’ll create one from your lecture" /></label>
           <label>Subject folder <small>Optional</small><input value={subject} onChange={event => setSubject(event.target.value)} placeholder="e.g. Operating Systems" /></label>
-        </div>
-        {mode === "audio" && <label className="language-select">Audio language<select value={language} onChange={event => setLanguage(event.target.value)}><option value="">Auto-detect</option><option value="en">English</option><option value="hi">Hindi</option><option value="gu">Gujarati</option></select></label>}
+        </div>}
+        {mode === "audio" && !resumeLecture && <label className="language-select">Audio language<select value={language} onChange={event => setLanguage(event.target.value)}><option value="">Auto-detect</option><option value="en">English</option><option value="hi">Hindi</option><option value="gu">Gujarati</option></select></label>}
         {error && <div className="form-alert">{error}</div>}
-        <div className="modal-foot"><span><span className="secure-dot" /> Private to your account</span><button className="button button-dark" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={16} />}{busy ? mode === "audio" ? uploadProgress === null ? "Retrying direct upload…" : `Uploading… ${uploadProgress}%` : "Starting…" : "Create my notes"} <ArrowRight size={16} /></button></div>
+        <div className="modal-foot"><span><span className="secure-dot" /> Private to your account</span><button className="button button-dark" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={16} />}{busy ? "Creating upload…" : resumeLecture ? "Resume upload" : "Create my notes"} <ArrowRight size={16} /></button></div>
       </form>
     </motion.section>
   </motion.div>;

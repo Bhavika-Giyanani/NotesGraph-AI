@@ -3020,3 +3020,92 @@ select:focus-visible {
     padding-inline: 7px;
   }
 }
+
+.subject-create {
+  display: flex;
+  gap: 5px;
+  margin: 0 5px 8px;
+}
+.subject-create input {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  color: var(--ink);
+  background: var(--surface);
+  font-size: 11px;
+}
+.subject-create button {
+  width: 30px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--green-dark);
+  background: var(--surface);
+  cursor: pointer;
+}
+.subject-create button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.workspace .sort-button {
+  cursor: pointer;
+}
+.workspace .message-content > :first-child {
+  margin-top: 0;
+}
+.workspace .message-content > :last-child {
+  margin-bottom: 0;
+}
+.workspace .message-content h1,
+.workspace .message-content h2,
+.workspace .message-content h3,
+.workspace .message-content h4 {
+  margin: 12px 0 5px;
+  color: inherit;
+  font-family: inherit;
+  font-size: 1em;
+  font-weight: 700;
+}
+.workspace .message-content ul,
+.workspace .message-content ol {
+  margin: 5px 0 9px;
+  padding-left: 20px;
+  font-size: 12px;
+  line-height: 1.65;
+}
+.workspace .message-content li + li {
+  margin-top: 3px;
+}
+.workspace .message-content blockquote {
+  margin: 8px 0;
+  padding-left: 10px;
+  border-left: 3px solid var(--green);
+  color: var(--muted);
+}
+.workspace .message-content pre {
+  overflow-x: auto;
+  margin: 8px 0;
+  padding: 10px;
+  border-radius: 7px;
+  color: var(--ink);
+  background: var(--surface-soft);
+  font-size: 11px;
+}
+.workspace .message-content :not(pre) > code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--surface-soft);
+  font-size: 0.9em;
+}
+.workspace .message-content a {
+  color: var(--green-dark);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.workspace .chat-message.user .message-content a {
+  color: #fff;
+}

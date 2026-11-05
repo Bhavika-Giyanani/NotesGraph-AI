@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import time
+import asyncio
 from pathlib import Path
 
 os.environ["DATA_DIR"] = tempfile.mkdtemp()
@@ -184,10 +185,77 @@ def test_retry_endpoint_does_not_download_audio_before_accepting(monkeypatch):
         lambda *_: (_ for _ in ()).throw(AssertionError("download must run in worker")),
     )
 
-    response = main.retry_lecture("lecture1", "user1")
+    response = asyncio.run(main.retry_lecture("lecture1", "user1"))
 
     assert response["status"] == "queued"
     assert scheduled == [("lecture1", "user1", None, None)]
+
+
+def test_audio_upload_record_is_created_before_upload_starts(monkeypatch):
+    from app import main, store
+
+    captured = {}
+    scheduled = []
+    row = {
+        "id": "lecture1",
+        "status": "uploading",
+        "progress": "Uploading recording to secure storage",
+    }
+
+    monkeypatch.setattr(main, "_validate_storage_upload", lambda *_: "lecture.mp3")
+    monkeypatch.setattr(
+        store,
+        "create",
+        lambda *args, **kwargs: captured.update(kwargs) or row,
+    )
+    monkeypatch.setattr(main, "_schedule_processing", lambda *args: scheduled.append(args))
+
+    result = asyncio.run(main.create_lecture(
+        file=None,
+        transcript_text="",
+        title="",
+        subject="",
+        language="",
+        storage_path="user1/00000000-0000-0000-0000-000000000001.mp3",
+        source_filename="lecture.mp3",
+        defer_processing=True,
+        user_id="user1",
+    ))
+
+    assert result["status"] == "uploading"
+    assert captured["status"] == "uploading"
+    assert scheduled == []
+
+
+def test_upload_status_transitions_start_and_record_failures(monkeypatch):
+    from app import main, store
+    from app.schemas import UploadFailure
+
+    lecture = {
+        "id": "lecture1",
+        "status": "uploading",
+        "audio_path": "user1/lecture1.mp3",
+    }
+    scheduled = []
+
+    def update(_, __, **fields):
+        lecture.update(fields)
+        return dict(lecture)
+
+    monkeypatch.setattr(main, "_require", lambda *_: lecture)
+    monkeypatch.setattr(store, "update", update)
+    monkeypatch.setattr(main, "_schedule_processing", lambda *args: scheduled.append(args))
+
+    started = asyncio.run(main.start_uploaded_lecture("lecture1", "user1"))
+    assert started["status"] == "queued"
+    assert scheduled == [("lecture1", "user1", None, None)]
+
+    lecture["status"] = "uploading"
+    failed = main.fail_lecture_upload(
+        "lecture1", UploadFailure(error="network disconnected"), "user1"
+    )
+    assert failed["status"] == "upload_error"
+    assert "network disconnected" in failed["error"]
 
 
 def test_chat_messages_always_include_non_null_sources(monkeypatch):

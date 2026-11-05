@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import auth, config, store
-from .schemas import ChatRequest
+from .schemas import ChatRequest, FolderCreate, UploadFailure
 
 log = logging.getLogger("notesgraph")
 logging.basicConfig(
@@ -431,6 +431,17 @@ def list_folders(user_id: str = Depends(auth.current_user)):
     return store.list_folders(user_id)
 
 
+@app.post("/api/folders", status_code=201)
+def create_folder(payload: FolderCreate, user_id: str = Depends(auth.current_user)):
+    name = " ".join(payload.name.split())
+    if not name:
+        raise HTTPException(422, "Subject name cannot be empty.")
+    folder = store.ensure_folder(user_id, name)
+    if folder is None:
+        raise RuntimeError("The subject folder could not be created.")
+    return folder
+
+
 @app.post("/api/lectures", status_code=202)
 async def create_lecture(
     file: Optional[UploadFile] = File(None),
@@ -440,6 +451,7 @@ async def create_lecture(
     language: str = Form(""),
     storage_path: str = Form(""),
     source_filename: str = Form(""),
+    defer_processing: bool = Form(False),
     user_id: str = Depends(auth.current_user),
 ):
     """Upload a recording, or paste a transcript, and start processing."""
@@ -447,6 +459,8 @@ async def create_lecture(
     storage_path = storage_path.strip()
     if (file is None or not file.filename) and not transcript_text and not storage_path:
         raise HTTPException(400, "Provide an audio file or a transcript.")
+    if defer_processing and not storage_path:
+        raise HTTPException(400, "Deferred processing requires a secure audio storage path.")
 
     audio_path: Optional[Path] = None
     if storage_path:
@@ -454,7 +468,15 @@ async def create_lecture(
             raise HTTPException(400, "Provide only one audio file or transcript.")
         filename = _validate_storage_upload(storage_path, source_filename, user_id)
         try:
-            meta = store.create(user_id, title, subject, filename, audio_path=storage_path)
+            meta = store.create(
+                user_id,
+                title,
+                subject,
+                filename,
+                audio_path=storage_path,
+                status="uploading" if defer_processing else "queued",
+                progress="Uploading recording to secure storage" if defer_processing else "Waiting to start",
+            )
         except Exception:
             log.exception("Could not create lecture record for user %s", user_id)
             raise HTTPException(
@@ -502,9 +524,40 @@ async def create_lecture(
         store.save_transcript(meta["id"], user_id, transcript_text)
 
     lang = re.sub(r"[^a-z]", "", language.lower())[:3] or None
-    _schedule_processing(meta["id"], user_id, audio_path, lang)
+    if not defer_processing:
+        _schedule_processing(meta["id"], user_id, audio_path, lang)
     log.info("Lecture accepted: %s (user %s)", meta["id"], user_id)
     return meta
+
+
+@app.post("/api/lectures/{lecture_id}/start-upload", status_code=202)
+async def start_uploaded_lecture(lecture_id: str, user_id: str = Depends(auth.current_user)):
+    meta = _require(lecture_id, user_id)
+    if meta["status"] not in ("uploading", "upload_error") or not meta.get("audio_path"):
+        raise HTTPException(409, "This lecture is not waiting for an audio upload.")
+    updated = store.update(
+        lecture_id, user_id, status="queued", progress="Waiting to start", error=""
+    )
+    _schedule_processing(lecture_id, user_id, None, None)
+    return updated
+
+
+@app.post("/api/lectures/{lecture_id}/upload-failed")
+def fail_lecture_upload(
+    lecture_id: str,
+    payload: UploadFailure,
+    user_id: str = Depends(auth.current_user),
+):
+    meta = _require(lecture_id, user_id)
+    if meta["status"] not in ("uploading", "upload_error"):
+        raise HTTPException(409, "This lecture is not currently uploading.")
+    return store.update(
+        lecture_id,
+        user_id,
+        status="upload_error",
+        progress="Audio upload failed",
+        error=f"Audio upload failed: {payload.error.strip()[:350]}",
+    )
 
 
 @app.get("/api/lectures/{lecture_id}")
@@ -555,7 +608,7 @@ def download_markdown(lecture_id: str, user_id: str = Depends(auth.current_user)
 
 
 @app.post("/api/lectures/{lecture_id}/retry", status_code=202)
-def retry_lecture(
+async def retry_lecture(
     lecture_id: str, user_id: str = Depends(auth.current_user)
 ):
     meta = _require(lecture_id, user_id)
@@ -581,7 +634,7 @@ def retry_lecture(
 
 
 @app.post("/api/lectures/{lecture_id}/retry-index", status_code=202)
-def retry_index(lecture_id: str, user_id: str = Depends(auth.current_user)):
+async def retry_index(lecture_id: str, user_id: str = Depends(auth.current_user)):
     meta = _require(lecture_id, user_id)
     if meta["status"] != "index_error":
         raise HTTPException(409, "Chat indexing does not need a retry.")

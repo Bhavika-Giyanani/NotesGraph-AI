@@ -43,6 +43,8 @@ def create(
     subject: str,
     source: str,
     audio_path: Optional[str] = None,
+    status: str = "queued",
+    progress: str = "Waiting to start",
 ) -> dict:
     folder = ensure_folder(user_id, subject)
     row = {
@@ -54,8 +56,8 @@ def create(
         "folder_id": folder["id"] if folder else None,
         "source": source,
         "audio_path": audio_path,
-        "status": "queued",
-        "progress": "Waiting to start",
+        "status": status,
+        "progress": progress,
         "error": "",
     }
     return client().table("lectures").insert(row).execute().data[0]
