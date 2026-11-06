@@ -1,5 +1,5 @@
 """Pydantic schemas: structured notes (LLM output) and API payloads."""
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -53,6 +53,29 @@ class Notes(BaseModel):
 class ChatRequest(BaseModel):
     session_id: str = Field(min_length=1, max_length=100)
     message: str = Field(min_length=1, max_length=4000)
+
+
+class ChatSource(BaseModel):
+    start: Optional[float] = None
+    end: Optional[float] = None
+    timestamp_label: Optional[str] = None
+    text_snippet: Optional[str] = None
+
+
+class ChatMessage(BaseModel):
+    id: int
+    role: Literal["user", "assistant"]
+    content: str
+    created_at: str
+    sources: List[ChatSource] = Field(default_factory=list)
+    status: Optional[Literal["pending", "complete", "error"]] = None
+    intent: Optional[Literal["locate", "explain", "off_topic"]] = None
+    grounded: Optional[bool] = None
+
+
+class ChatTurn(BaseModel):
+    user_message: ChatMessage
+    assistant_message: ChatMessage
 
 
 class FolderCreate(BaseModel):

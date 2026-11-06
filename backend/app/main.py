@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import auth, config, store
-from .schemas import ChatRequest, FolderCreate, UploadFailure
+from .schemas import ChatMessage, ChatRequest, ChatTurn, FolderCreate, UploadFailure
 
 log = logging.getLogger("notesgraph")
 logging.basicConfig(
@@ -288,6 +288,8 @@ def process_chat_answer(
             user_id,
             result["answer"],
             result.get("sources") or [],
+            result["intent"],
+            result["grounded"],
         )
         log.info("Chat answer generation completed for session %s", session_id)
     except Exception:
@@ -371,11 +373,12 @@ def _temp_audio_from_storage(meta: dict) -> Optional[Path]:
         return Path(audio_file.name)
 
 
-def _is_missing_chat_status_column(exc: Exception) -> bool:
+def _is_missing_chat_schema_column(exc: Exception) -> bool:
     message = str(exc).lower()
-    return (
-        ("42703" in message and "chat_messages.status" in message)
-        or "column chat_messages.status does not exist" in message
+    return any(
+        (f"chat_messages.{column}" in message and "42703" in message)
+        or f"column chat_messages.{column} does not exist" in message
+        for column in ("status", "intent", "grounded")
     )
 
 
@@ -384,7 +387,7 @@ def _chat_schema_migration_error() -> HTTPException:
         status_code=503,
         detail=(
             "The chat database schema needs an update. Run "
-            "backend/supabase/migrations/20261030_chat_message_status.sql "
+            "backend/supabase/migrations/20261106_chat_grounding_metadata.sql "
             "in your Supabase SQL Editor, then retry."
         ),
     )
@@ -676,19 +679,19 @@ def create_chat_session(lecture_id: str, user_id: str = Depends(auth.current_use
     return store.create_chat_session(user_id, lecture_id)
 
 
-@app.get("/api/chat-sessions/{session_id}/messages")
+@app.get("/api/chat-sessions/{session_id}/messages", response_model=list[ChatMessage])
 def get_chat_messages(session_id: str, user_id: str = Depends(auth.current_user)):
     if store.get_chat_session(session_id, user_id) is None:
         raise HTTPException(404, "Chat session not found")
     try:
         return store.get_chat_messages(session_id, user_id)
     except Exception as exc:
-        if _is_missing_chat_status_column(exc):
+        if _is_missing_chat_schema_column(exc):
             raise _chat_schema_migration_error() from exc
         raise
 
 
-@app.post("/api/lectures/{lecture_id}/chat", status_code=202)
+@app.post("/api/lectures/{lecture_id}/chat", status_code=202, response_model=ChatTurn)
 async def chat(
     lecture_id: str, req: ChatRequest, user_id: str = Depends(auth.current_user)
 ):
@@ -709,7 +712,7 @@ async def chat(
         )
     except Exception as exc:
         log.exception("Chat question could not be saved")
-        if _is_missing_chat_status_column(exc):
+        if _is_missing_chat_schema_column(exc):
             raise _chat_schema_migration_error() from exc
         raise HTTPException(503, "Your question could not be saved. Please try again.") from exc
     if session["title"] == "New chat":

@@ -48,6 +48,8 @@ create table if not exists public.chat_messages (
   role text not null check (role in ('user', 'assistant')),
   content text not null,
   sources jsonb not null default '[]'::jsonb,
+  intent text check (intent in ('locate', 'explain', 'off_topic')),
+  grounded boolean,
   status text not null default 'complete' check (status in ('pending', 'complete', 'error')),
   created_at timestamptz not null default now()
 );
@@ -55,6 +57,11 @@ create table if not exists public.chat_messages (
 alter table public.chat_messages
   add column if not exists status text not null default 'complete'
   check (status in ('pending', 'complete', 'error'));
+
+alter table public.chat_messages
+  add column if not exists intent text
+  check (intent in ('locate', 'explain', 'off_topic')),
+  add column if not exists grounded boolean;
 
 update public.chat_messages set sources = '[]'::jsonb where sources is null;
 alter table public.chat_messages alter column sources set default '[]'::jsonb;

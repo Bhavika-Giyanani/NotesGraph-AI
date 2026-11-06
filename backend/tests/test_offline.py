@@ -44,9 +44,10 @@ def test_render_markdown_and_pdf():
     assert notes_to_pdf(empty)[:4] == b"%PDF"
 
 
-def test_chat_memory_and_followup_rewrite():
+def test_chat_memory_and_followup_rewrite(monkeypatch):
     """The follow-up must be rewritten using history, and history must persist per session."""
-    from app.rag import build_chain, ask
+    from app import rag
+
     llm = GenericFakeChatModel(messages=iter([
         AIMessage(content="Deadlock is when processes wait on each other forever."),       # answer 1
         AIMessage(content="Give an example of deadlock"),                                  # rewrite of follow-up
@@ -54,14 +55,22 @@ def test_chat_memory_and_followup_rewrite():
     ]))
     seen = []
 
-    def retrieve(question, lecture_id, user_id):
+    def retrieve(question, lecture_id, user_id, match_count):
         seen.append((question, lecture_id))
-        return [Document(page_content="Deadlock needs four conditions.", metadata={"chunk": 0})]
+        return [Document(
+            page_content="Deadlock needs four conditions.",
+            metadata={
+                "chunk": 0,
+                "similarity": 0.8,
+                "segments": [{"start": 60, "end": 70, "text": "Deadlock needs four conditions."}],
+            },
+        )]
 
-    chain = build_chain(llm, retrieve)
-    r1 = ask("lec1", "s1", "What is deadlock?", chain=chain)
-    r2 = ask("lec1", "s1", "Can you give an example?", chain=chain)
-    assert "wait" in r1["answer"] and r1["sources"][0]["chunk"] == 0
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(rag, "_retrieve", retrieve)
+    r1 = rag.ask("lec1", "s1", "What is deadlock?")
+    r2 = rag.ask("lec1", "s1", "Can you give an example?")
+    assert "wait" in r1["answer"] and r1["sources"][0]["start"] == 60
     assert seen[0][0] == "What is deadlock?"          # first question: no rewrite
     assert seen[1][0] == "Give an example of deadlock"  # follow-up: rewritten with history
     assert seen[1][1] == "lec1"
@@ -71,7 +80,7 @@ def test_chat_memory_and_followup_rewrite():
 
 def test_title_and_audio_timestamp_helpers():
     from app.main import _allocate_title
-    from app.rag import _documents, _format_docs, format_timestamp
+    from app.rag import _documents, format_timestamp
 
     assert _allocate_title({"title": "Untitled lecture", "core_explanations": []}, "Deadlocks prevent progress.", "") == "Deadlocks prevent progress"
     assert _allocate_title({"title": "", "core_explanations": [{"topic": "Deadlock"}]}, "text", "") == "Deadlock"
@@ -82,8 +91,89 @@ def test_title_and_audio_timestamp_helpers():
     ) == "Deadlock Prevention"
     assert format_timestamp(3723) == "01:02:03"
     docs = _documents("Deadlock explanation", [{"start": 60, "end": 72, "text": "Deadlock explanation"}])
-    assert "01:00-01:12" in _format_docs(docs)
     assert docs[0].metadata["start_seconds"] == 60
+    assert docs[0].metadata["segments"] == [
+        {"start": 60, "end": 72, "text": "Deadlock explanation"}
+    ]
+
+
+def _citation_doc(start, end, text, similarity=0.8, chunk_start=None):
+    return Document(
+        page_content=text,
+        metadata={
+            "similarity": similarity,
+            "start_seconds": start if chunk_start is None else chunk_start,
+            "end_seconds": end,
+            "segments": [{"start": start, "end": end, "text": text}],
+        },
+    )
+
+
+def _fake_answer_llm(monkeypatch, app_rag):
+    llm = GenericFakeChatModel(messages=iter([AIMessage(content="Grounded answer.")]))
+    monkeypatch.setattr(app_rag, "get_llm", lambda **_: llm)
+
+
+def test_off_topic_has_no_sources_and_is_not_grounded(monkeypatch):
+    from app import rag
+
+    monkeypatch.setattr(rag, "_retrieve", lambda *args: [_citation_doc(0, 5, "Lecture excerpt", 0.1)])
+    monkeypatch.setattr(
+        rag, "get_llm", lambda **_: (_ for _ in ()).throw(AssertionError("LLM should not answer"))
+    )
+    result = rag.ask("lec-off-topic", "s1", "What is quantum computing?")
+
+    assert result["sources"] == []
+    assert result["grounded"] is False
+    assert result["intent"] == "off_topic"
+
+
+def test_locate_merges_nearby_hits_and_sorts_ranges(monkeypatch):
+    from app import rag
+
+    docs = [
+        _citation_doc(100, 105, "Mitosis begins here."),
+        _citation_doc(30, 35, "Mitosis is cell division."),
+        _citation_doc(110, 118, "Mitosis produces two cells."),
+    ]
+    requested = []
+    monkeypatch.setattr(rag, "_retrieve", lambda question, lecture, user, count: requested.append(count) or docs)
+    _fake_answer_llm(monkeypatch, rag)
+
+    result = rag.ask("lec-locate", "s1", "Where does the speaker discuss mitosis?")
+
+    assert requested == [rag.config.RAG_LOCATE_K]
+    assert result["intent"] == "locate"
+    assert [source["start"] for source in result["sources"]] == [30, 100]
+    assert result["sources"][1]["end"] == 118
+    assert result["sources"][1]["timestamp_label"] == "01:40-01:58"
+
+
+def test_explain_returns_at_most_three_sources(monkeypatch):
+    from app import rag
+
+    docs = [_citation_doc(index * 40, index * 40 + 4, "Mitochondria make cellular energy.") for index in range(5)]
+    monkeypatch.setattr(rag, "_retrieve", lambda *args: docs)
+    _fake_answer_llm(monkeypatch, rag)
+
+    result = rag.ask("lec-explain", "s1", "Explain mitochondria")
+
+    assert result["intent"] == "explain"
+    assert result["grounded"] is True
+    assert len(result["sources"]) == 3
+
+
+def test_citation_time_uses_segment_metadata_not_chunk_start(monkeypatch):
+    from app import rag
+
+    doc = _citation_doc(123, 130, "Mitochondria make cellular energy.", chunk_start=0)
+    monkeypatch.setattr(rag, "_retrieve", lambda *args: [doc])
+    _fake_answer_llm(monkeypatch, rag)
+
+    result = rag.ask("lec-segment-time", "s1", "Explain mitochondria")
+
+    assert result["sources"][0]["start"] == 123
+    assert result["sources"][0]["timestamp_label"] == "02:03"
 
 
 def test_embedding_retries_transient_provider_failures(monkeypatch):
@@ -312,16 +402,17 @@ def test_failed_background_chat_is_saved_as_terminal_error(monkeypatch):
     assert failed == [(42, "session1", "user1")]
 
 
-def test_missing_chat_status_column_returns_migration_guidance():
-    from app.main import _chat_schema_migration_error, _is_missing_chat_status_column
+def test_missing_chat_metadata_columns_return_migration_guidance():
+    from app.main import _chat_schema_migration_error, _is_missing_chat_schema_column
 
-    error = RuntimeError(
-        "{'message': 'column chat_messages.status does not exist', 'code': '42703'}"
+    error = RuntimeError("{'message': 'column chat_messages.grounded does not exist', 'code': '42703'}")
+
+    assert _is_missing_chat_schema_column(error)
+    assert "20261106_chat_grounding_metadata.sql" in _chat_schema_migration_error().detail
+    assert _is_missing_chat_schema_column(
+        RuntimeError("{'message': 'column chat_messages.status does not exist', 'code': '42703'}")
     )
-
-    assert _is_missing_chat_status_column(error)
-    assert "20261030_chat_message_status.sql" in _chat_schema_migration_error().detail
-    assert not _is_missing_chat_status_column(RuntimeError("network timeout"))
+    assert not _is_missing_chat_schema_column(RuntimeError("network timeout"))
 
 
 def test_supabase_new_key_client_configuration(monkeypatch):
@@ -432,9 +523,9 @@ def test_api_flow(monkeypatch):
         chat_messages[session_id].extend([user_row, assistant_row])
         return user_row, assistant_row
 
-    def fake_complete_chat_reply(message_id, session_id, user_id, answer, sources):
+    def fake_complete_chat_reply(message_id, session_id, user_id, answer, sources, intent, grounded):
         row = next(message for message in chat_messages[session_id] if message["id"] == message_id)
-        row.update(content=answer, sources=sources, status="complete")
+        row.update(content=answer, sources=sources, intent=intent, grounded=grounded, status="complete")
 
     def fake_fail_chat_reply(message_id, session_id, user_id):
         row = next(message for message in chat_messages[session_id] if message["id"] == message_id)
@@ -459,7 +550,12 @@ def test_api_flow(monkeypatch):
     monkeypatch.setattr(store, "fail_chat_reply", fake_fail_chat_reply)
     monkeypatch.setattr(store, "update_chat_title", lambda session_id, user_id, title: chat_sessions[session_id].update(title=title))
     from app import rag
-    monkeypatch.setattr(rag, "ask", lambda lecture_id, session_id, message, **kwargs: {"answer": "Deadlock occurs at [01:00].", "sources": [{"timestamp": "01:00", "text": "deadlock"}]})
+    monkeypatch.setattr(rag, "ask", lambda lecture_id, session_id, message, **kwargs: {
+        "answer": "Deadlock occurs in the lecture.",
+        "sources": [{"start": 60, "end": 60, "timestamp_label": "01:00", "text_snippet": "deadlock"}],
+        "intent": "explain",
+        "grounded": True,
+    })
     monkeypatch.setattr(main, "process_lecture", fake_process)
     c = TestClient(main.app)
     assert c.get("/api/health").json()["ok"]
@@ -493,7 +589,9 @@ def test_api_flow(monkeypatch):
             break
         time.sleep(0.02)
     assert messages[0]["content"] == "When is deadlock explained?"
-    assert messages[1]["status"] == "complete" and "01:00" in messages[1]["sources"][0]["timestamp"]
+    assert messages[1]["status"] == "complete"
+    assert messages[1]["sources"][0]["timestamp_label"] == "01:00"
+    assert messages[1]["grounded"] is True and messages[1]["intent"] == "explain"
     assert c.get(f"/api/lectures/nope", headers=headers).status_code == 404
     monkeypatch.setitem(main.app.dependency_overrides, main.auth.current_user, lambda: "user-b")
     assert c.get(f"/api/lectures/{lid}", headers=headers).status_code == 404

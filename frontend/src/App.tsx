@@ -26,11 +26,46 @@ type Notes = {
 };
 type Folder = { id: string; name: string };
 type ChatSession = { id: string; lecture_id: string; title: string; updated_at: string };
+type ChatSource = {
+  start?: number; end?: number; timestamp_label?: string; text_snippet?: string;
+};
 type ChatMessage = {
   id: number; role: "user" | "assistant"; content: string; created_at: string;
   status?: "pending" | "complete" | "error";
-  sources?: { timestamp?: string; text: string }[];
+  sources?: ChatSource[];
+  intent?: "locate" | "explain" | "off_topic";
+  grounded?: boolean;
 };
+
+function formatSourceTime(seconds: number) {
+  const total = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const remainder = total % 60;
+  return hours
+    ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
+    : `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+}
+
+function sourceLabel(source: ChatSource) {
+  if (typeof source.start === "number") {
+    const start = formatSourceTime(source.start);
+    return typeof source.end === "number" && source.end > source.start
+      ? `${start}–${formatSourceTime(source.end)}`
+      : start;
+  }
+  return source.timestamp_label || "";
+}
+
+function displaySources(message: ChatMessage) {
+  if (message.grounded === false || !message.sources?.length) return [];
+  const unique = new Map(
+    message.sources
+      .filter(source => typeof source.start === "number")
+      .map(source => [`${source.start}-${source.end ?? source.start}`, source]),
+  );
+  return [...unique.values()].sort((left, right) => (left.start ?? 0) - (right.start ?? 0));
+}
 const configuredApiUrl = (
   window.NOTESGRAPH_CONFIG?.apiUrl || import.meta.env.VITE_API_URL || ""
 ).trim();
@@ -882,6 +917,44 @@ function LectureView({ lecture, view, setView, onBack, onDelete, onRetry, onRetr
   setMessages: Dispatch<SetStateAction<ChatMessage[]>>;
   transcript: string; onTranscript: () => void;
 }) {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [audioUrl, setAudioUrl] = useState("");
+  const [audioError, setAudioError] = useState("");
+
+  useEffect(() => {
+    if (!lecture.audio_path || !supabase) {
+      setAudioUrl("");
+      setAudioError("");
+      return;
+    }
+    let active = true;
+    setAudioUrl("");
+    setAudioError("");
+    supabase.storage.from("lecture-audio").createSignedUrl(lecture.audio_path, 3600)
+      .then(({ data, error }) => {
+        if (error) throw error;
+        if (active) {
+          setAudioUrl(data.signedUrl);
+          setAudioError("");
+        }
+      })
+      .catch(reason => {
+        if (active) setAudioError(userFacingError(reason));
+      });
+    return () => { active = false; };
+  }, [lecture.audio_path]);
+
+  const onSeek = useCallback((startSeconds: number) => {
+    const audio = audioRef.current;
+    if (!audio) {
+      setAudioError("The lecture audio is not ready to play yet.");
+      return;
+    }
+    setAudioError("");
+    audio.currentTime = Math.max(0, startSeconds - 1.5);
+    void audio.play().catch(reason => setAudioError(userFacingError(reason)));
+  }, []);
+
   return <motion.section className="lecture-detail" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
     <button className="back-library" onClick={onBack}><ArrowRight className="back-arrow" size={15} /> Library</button>
     <div className="detail-heading"><div><span className="eyebrow">{lecture.subject || "LECTURE NOTES"}</span><h1>{lecture.title}</h1><p>{lecture.source} <span>·</span> Added {new Date(lecture.created_at).toLocaleDateString()}</p></div>
@@ -897,9 +970,11 @@ function LectureView({ lecture, view, setView, onBack, onDelete, onRetry, onRetr
     {lecture.status === "index_error" && <div className="process-banner process-error">{lecture.error || "Your notes are ready. Chat indexing can be retried without regenerating them."}</div>}
     {(lecture.status === "done" || lecture.status === "index_error") && <div className="detail-layout">
       <div className="detail-primary">
+        {audioUrl && <div className="lecture-audio"><audio ref={audioRef} controls preload="metadata" src={audioUrl}>Your browser does not support audio playback.</audio></div>}
+        {audioError && <p className="audio-error">{audioError}</p>}
         <div className="detail-tabs"><button className={view === "notes" ? "active" : ""} onClick={() => setView("notes")}><FileText size={16} /> Study notes</button><button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")}><MessageCircle size={16} /> Ask this lecture</button><button className={view === "transcript" ? "active" : ""} onClick={onTranscript}><AudioLines size={16} /> Transcript</button></div>
         {view === "notes" && <NotesView notes={lecture.notes} />}
-        {view === "chat" && <ChatView lectureId={lecture.id} sessions={sessions} active={active} messages={messages} onCreate={onCreate} onChoose={onChoose} setMessages={setMessages} />}
+        {view === "chat" && <ChatView lectureId={lecture.id} sessions={sessions} active={active} messages={messages} onCreate={onCreate} onChoose={onChoose} setMessages={setMessages} onSeek={onSeek} />}
         {view === "transcript" && <div className="transcript-panel"><div className="panel-title"><div><span className="eyebrow">FROM THE RECORDING</span><h2>Lecture transcript</h2></div><span className="transcript-readonly"><Check size={14} /> Source transcript</span></div><pre>{transcript || "Loading transcript…"}</pre></div>}
       </div>
       <aside className="detail-aside"><div className="aside-card"><span className="aside-icon"><Sparkles size={17} /></span><span className="eyebrow">QUICK OVERVIEW</span><p>{lecture.notes?.summary || "Your lecture summary will appear here."}</p><div className="aside-stats"><span><b>{lecture.notes?.core_explanations?.length || 0}</b> topics</span><span><b>{lecture.notes?.exam_points?.length || 0}</b> exam tips</span></div></div>
@@ -924,10 +999,11 @@ function NoteSection({ title, tone, icon, children }: { title: string; tone: str
   return <section className={`note-section ${tone}`}><div className="note-section-title"><span>{icon}</span><h2>{title}</h2></div>{children}</section>;
 }
 
-function ChatView({ lectureId, sessions, active, messages, onCreate, onChoose, setMessages }: {
+function ChatView({ lectureId, sessions, active, messages, onCreate, onChoose, setMessages, onSeek }: {
   lectureId: string; sessions: ChatSession[]; active: ChatSession | null; messages: ChatMessage[];
   onCreate: () => void; onChoose: (session: ChatSession, loadMessages?: boolean) => void;
   setMessages: Dispatch<SetStateAction<ChatMessage[]>>;
+  onSeek: (startSeconds: number) => void;
 }) {
   const [question, setQuestion] = useState("");
   const [sending, setSending] = useState(false);
@@ -1014,7 +1090,13 @@ function ChatView({ lectureId, sessions, active, messages, onCreate, onChoose, s
     {showHistory && <div className="chat-history-dropdown">{sessions.map(chat => <button key={chat.id} onClick={() => { onChoose(chat); setShowHistory(false); }}><MessageCircle size={15} />{chat.title}</button>)}</div>}
     <div className="chat-messages">
       {!messages.length && <div className="chat-welcome"><span><Sparkles size={20} /></span><h3>Your lecture, on demand.</h3><p>Ask a question and I’ll point you to the relevant moment in the recording.</p><div className="prompt-suggestions">{["What should I focus on for the exam?", "Explain the main idea simply", "Where does the lecture discuss its key example?"].map(text => <button key={text} onClick={() => setQuestion(text)}>{text} <ArrowRight size={14} /></button>)}</div></div>}
-      {messages.map(message => <div key={message.id} className={`chat-message ${message.role}`}><span className="message-avatar">{message.role === "assistant" ? <Sparkles size={15} /> : "Y"}</span><div className={`message-content ${message.status === "error" ? "message-failed" : ""}`}>{message.status === "pending" ? <div className="thinking"><span /><span /><span /></div> : message.role === "assistant" ? <ReactMarkdown>{message.content}</ReactMarkdown> : <p>{message.content}</p>}{message.sources?.some(source => source.timestamp) && <div className="source-list"><span>IN THE RECORDING</span>{message.sources.filter(source => source.timestamp).map((source, index) => <span className="source-chip" key={`${source.timestamp}-${index}`} title={source.text}><Clock3 size={13} /> {source.timestamp}</span>)}</div>}</div></div>)}
+      {messages.map(message => {
+        const sources = displaySources(message);
+        return <div key={message.id} className={`chat-message ${message.role}`}><span className="message-avatar">{message.role === "assistant" ? <Sparkles size={15} /> : "Y"}</span><div className={`message-content ${message.status === "error" ? "message-failed" : ""}`}>{message.status === "pending" ? <div className="thinking"><span /><span /><span /></div> : message.role === "assistant" ? <ReactMarkdown>{message.content}</ReactMarkdown> : <p>{message.content}</p>}{message.role === "assistant" && message.intent === "off_topic" && message.grounded === false && <p className="not-covered-note">Not covered in this lecture</p>}{sources.length > 0 && <div className="source-list"><span>{message.intent === "locate" ? `MENTIONED AT · ${sources.length} passages` : "RELATED MOMENTS"}</span>{sources.map(source => {
+          const label = sourceLabel(source);
+          return <button type="button" className="source-chip" key={`${source.start}-${source.end ?? source.start}`} title={source.text_snippet || ""} aria-label={`Jump to ${label}`} onClick={() => onSeek(source.start ?? 0)}><Clock3 size={13} /> {label}</button>;
+        })}</div>}</div></div>;
+      })}
     </div>
     {error && <div className="chat-error">{error}</div>}
     <form className="chat-composer" onSubmit={submit}><textarea value={question} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder="Ask a question about this lecture…" rows={1} />

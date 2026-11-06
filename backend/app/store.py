@@ -201,7 +201,7 @@ def get_chat_messages(session_id: str, user_id: str) -> list:
     return (
         client()
         .table("chat_messages")
-        .select("id,role,content,sources,status,created_at")
+        .select("id,role,content,sources,status,intent,grounded,created_at")
         .eq("session_id", session_id)
         .eq("user_id", user_id)
         .order("id")
@@ -244,6 +244,8 @@ def create_chat_turn(
                     "content": user_message,
                     "sources": [],
                     "status": "complete",
+                    "intent": None,
+                    "grounded": None,
                 },
                 {
                     "session_id": session_id,
@@ -252,6 +254,8 @@ def create_chat_turn(
                     "content": "",
                     "sources": [],
                     "status": "pending",
+                    "intent": None,
+                    "grounded": None,
                 },
             ]
         )
@@ -269,12 +273,26 @@ def create_chat_turn(
 
 
 def complete_chat_reply(
-    message_id: int, session_id: str, user_id: str, answer: str, sources: list
+    message_id: int,
+    session_id: str,
+    user_id: str,
+    answer: str,
+    sources: list,
+    intent: str,
+    grounded: bool,
 ) -> None:
     result = (
         client()
         .table("chat_messages")
-        .update({"content": answer, "sources": sources or [], "status": "complete"})
+        .update(
+            {
+                "content": answer,
+                "sources": sources or [],
+                "intent": intent,
+                "grounded": grounded,
+                "status": "complete",
+            }
+        )
         .eq("id", message_id)
         .eq("session_id", session_id)
         .eq("user_id", user_id)
@@ -293,6 +311,8 @@ def fail_chat_reply(message_id: int, session_id: str, user_id: str) -> None:
             {
                 "content": "I couldn't generate an answer just now. Please try asking again.",
                 "sources": [],
+                "intent": None,
+                "grounded": False,
                 "status": "error",
             }
         )
@@ -312,6 +332,8 @@ def add_chat_messages(
     user_message: str,
     answer: str,
     sources: Optional[list] = None,
+    intent: Optional[str] = None,
+    grounded: Optional[bool] = None,
 ) -> None:
     supabase = client()
     normalized_sources = sources or []
@@ -323,6 +345,8 @@ def add_chat_messages(
                 "role": "user",
                 "content": user_message,
                 "sources": [],
+                "intent": None,
+                "grounded": None,
             },
             {
                 "session_id": session_id,
@@ -330,6 +354,8 @@ def add_chat_messages(
                 "role": "assistant",
                 "content": answer,
                 "sources": normalized_sources,
+                "intent": intent,
+                "grounded": grounded,
             },
         ]
     ).execute()

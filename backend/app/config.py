@@ -39,6 +39,8 @@ CHUNK_MINUTES = int(os.getenv("CHUNK_MINUTES", "10"))
 RAG_CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "1000"))
 RAG_CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "150"))
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "6"))
+RAG_LOCATE_K = int(os.getenv("RAG_LOCATE_K", "20"))
+RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.35"))
 HISTORY_WINDOW = int(os.getenv("HISTORY_WINDOW", "10"))  # messages kept in the prompt
 
 ALLOWED_AUDIO_EXT = {".mp3", ".wav", ".m4a", ".mp4", ".aac", ".ogg", ".flac", ".webm", ".opus", ".wma"}

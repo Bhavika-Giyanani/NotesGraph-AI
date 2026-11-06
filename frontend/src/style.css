@@ -1984,13 +1984,35 @@ select:focus-visible {
   align-items: center;
   gap: 4px;
   padding: 4px 6px;
+  border: 0;
   border-radius: 5px;
   color: #4c7f5e;
   background: var(--green-soft);
   font-family: Inter, sans-serif;
   font-size: 8px;
   font-weight: 700;
-  cursor: help;
+  cursor: pointer;
+}
+.source-chip:hover,
+.source-chip:focus-visible {
+  background: #dcebe0;
+  outline: 2px solid #8eaf98;
+  outline-offset: 1px;
+}
+.lecture-audio {
+  margin-bottom: 16px;
+}
+.lecture-audio audio {
+  display: block;
+  width: 100%;
+}
+.audio-error,
+.not-covered-note {
+  color: #78827b;
+  font: 10px Inter, sans-serif;
+}
+.not-covered-note {
+  margin-top: 8px !important;
 }
 .thinking {
   display: flex;
