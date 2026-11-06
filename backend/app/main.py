@@ -293,6 +293,7 @@ def process_chat_answer(
     question: str,
     assistant_message_id: int,
     history: list[dict],
+    accept_offer: bool = False,
 ) -> None:
     """Generate an answer for a persisted chat turn and save its terminal state."""
     from .rag import ask
@@ -305,6 +306,7 @@ def process_chat_answer(
             question,
             user_id=user_id,
             history=history,
+            accept_offer=accept_offer,
         )
         store.complete_chat_reply(
             assistant_message_id,
@@ -314,7 +316,12 @@ def process_chat_answer(
             result.get("sources") or [],
             result["intent"],
             result["grounded"],
+            result.get("pending_offer"),
         )
+        if result.get("consumed_offer_message_id") is not None:
+            store.clear_pending_offer(
+                result["consumed_offer_message_id"], session_id, user_id
+            )
         log.info("Chat answer generation completed for session %s", session_id)
     except Exception:
         log.exception("Chat answer generation failed for session %s", session_id)
@@ -402,7 +409,7 @@ def _is_missing_chat_schema_column(exc: Exception) -> bool:
     return any(
         (f"chat_messages.{column}" in message and "42703" in message)
         or f"column chat_messages.{column} does not exist" in message
-        for column in ("status", "intent", "grounded")
+        for column in ("status", "intent", "grounded", "pending_offer")
     )
 
 
@@ -411,7 +418,8 @@ def _chat_schema_migration_error() -> HTTPException:
         status_code=503,
         detail=(
             "The chat database schema needs an update. Run "
-            "backend/supabase/migrations/20261106_chat_grounding_metadata.sql "
+            "backend/supabase/migrations/20261106_chat_grounding_metadata.sql, then "
+            "backend/supabase/migrations/20261106_chat_pending_offer_and_intents.sql "
             "in your Supabase SQL Editor, then retry."
         ),
     )
@@ -467,6 +475,19 @@ def create_folder(payload: FolderCreate, user_id: str = Depends(auth.current_use
     if folder is None:
         raise RuntimeError("The subject folder could not be created.")
     return folder
+
+
+@app.delete("/api/folders/{folder_id}", status_code=204)
+def delete_folder(folder_id: str, user_id: str = Depends(auth.current_user)):
+    result = store.delete_folder(user_id, folder_id)
+    if result == "not_found":
+        raise HTTPException(404, "Subject not found")
+    if result == "not_empty":
+        raise HTTPException(
+            409,
+            "Move or delete the subject's lectures before deleting this subject.",
+        )
+    return Response(status_code=204)
 
 
 @app.post("/api/lectures", status_code=202)
@@ -600,6 +621,28 @@ def get_transcript(lecture_id: str, user_id: str = Depends(auth.current_user)):
     if text is None:
         raise HTTPException(404, "Transcript not ready")
     return Response(text, media_type="text/plain; charset=utf-8")
+
+
+@app.get("/api/lectures/{lecture_id}/segments")
+def get_transcript_segments(
+    lecture_id: str, user_id: str = Depends(auth.current_user)
+):
+    _require(lecture_id, user_id)
+    if store.load_transcript(lecture_id, user_id) is None:
+        raise HTTPException(404, "Transcript not ready")
+    segments = store.load_transcript_segments(lecture_id, user_id)
+    return [
+        {
+            "start": segment["start"],
+            "end": segment["end"],
+            "text": segment["text"],
+        }
+        for segment in segments
+        if isinstance(segment, dict)
+        and segment.get("start") is not None
+        and segment.get("end") is not None
+        and isinstance(segment.get("text"), str)
+    ]
 
 
 @app.get("/api/lectures/{lecture_id}/notes.pdf")
@@ -749,6 +792,7 @@ async def chat(
             req.message,
             assistant_message["id"],
             history,
+            req.accept_offer,
         ),
         name=f"answer-chat-{assistant_message['id']}",
     )
@@ -775,6 +819,16 @@ def reset_chat(session_id: str, user_id: str = Depends(auth.current_user)):
     if store.get_chat_session(session_id, user_id) is None:
         raise HTTPException(404, "Chat session not found")
     store.clear_chat_session(session_id, user_id)
+    from .rag import clear_history
+
+    clear_history(user_id, session_id)
+    return Response(status_code=204)
+
+
+@app.delete("/api/chat-sessions/{session_id}", status_code=204)
+def delete_chat(session_id: str, user_id: str = Depends(auth.current_user)):
+    if not store.delete_chat_session(session_id, user_id):
+        raise HTTPException(404, "Chat session not found")
     from .rag import clear_history
 
     clear_history(user_id, session_id)

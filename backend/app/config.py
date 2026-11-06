@@ -44,5 +44,6 @@ RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.35"))
 RAG_LEXICAL_MIN_MATCHES = int(os.getenv("RAG_LEXICAL_MIN_MATCHES", "1"))
 DEBUG_CITATIONS = os.getenv("DEBUG_CITATIONS", "").strip().lower() in {"1", "true", "yes", "on"}
 HISTORY_WINDOW = int(os.getenv("HISTORY_WINDOW", "10"))  # messages kept in the prompt
+FOLLOWUP_HISTORY_WINDOW = int(os.getenv("FOLLOWUP_HISTORY_WINDOW", "6"))
 
 ALLOWED_AUDIO_EXT = {".mp3", ".wav", ".m4a", ".mp4", ".aac", ".ogg", ".flac", ".webm", ".opus", ".wma"}

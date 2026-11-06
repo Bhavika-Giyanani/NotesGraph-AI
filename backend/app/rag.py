@@ -38,14 +38,66 @@ ANSWER_SYSTEM = (
 )
 
 GENERAL_SYSTEM = (
-    "Answer the student's question briefly using general knowledge, not the lecture. "
+    "Answer the student's question in at most 150 words using general knowledge, not the lecture. "
     "Do not invent citations or timestamps."
+)
+
+CONVERSATION_SYSTEM = (
+    "Answer the student's question only from the conversation history in this chat. "
+    "Do not use the lecture or outside knowledge. If the history does not contain the answer, say so."
+)
+
+CONVERSATION_CLASSIFIER_SYSTEM = (
+    "Decide whether the student's latest message asks about the chat history itself, such as "
+    "their earlier questions or what was said in this conversation. Reply with exactly YES or NO."
+)
+
+OFFER_ACCEPTANCE_SYSTEM = (
+    "Decide whether the student's short reply accepts the assistant's offer to answer the "
+    "stored question using general knowledge. Reply with exactly YES or NO. Treat topic changes, "
+    "new questions, rejection, or uncertainty as NO."
 )
 
 LOCATE_PATTERNS = (
     re.compile(r"\b(?:where|when)\b", re.IGNORECASE),
     re.compile(r"\b(?:at what point|which part|what time|what timestamp)\b", re.IGNORECASE),
     re.compile(r"\b(?:locate|find)\b.{0,30}\b(?:lecture|recording|speaker|mention|discuss)\b", re.IGNORECASE),
+)
+
+CONVERSATION_PATTERNS = (
+    re.compile(r"\bwhat\s+(?:did|have)\s+i\s+ask(?:ed)?\b", re.IGNORECASE),
+    re.compile(r"\bmy\s+(?:previous|last|earlier)\s+question\b", re.IGNORECASE),
+    re.compile(r"\b(?:summari[sz]e|recap)\s+(?:our|this|the)\s+conversation\b", re.IGNORECASE),
+    re.compile(r"\brepeat\s+(?:that|it|what\s+(?:you|i)\s+said)\b", re.IGNORECASE),
+)
+CONVERSATION_CANDIDATE_PATTERN = re.compile(
+    r"\b(?:previous|earlier|before|last|chat|conversation|recap|repeat|remember|"
+    r"asked|question|said)\b",
+    re.IGNORECASE,
+)
+
+FOLLOWUP_PATTERNS = (
+    re.compile(r"\b(?:it|that|this|these|those|they|them|he|she)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:more simply|in simpler terms|give (?:me )?(?:an )?example|"
+        r"(?:another|one more) example|explain (?:it|that|this) simply)\b",
+        re.IGNORECASE,
+    ),
+)
+
+OFFER_AFFIRMATIVE_PATTERN = re.compile(
+    r"^(?:go ahead|yes|sure|ok(?:ay)?|please do|yes please|tell me|"
+    r"please|do it|sounds good|that would be great)[.! ]*$",
+    re.IGNORECASE,
+)
+OFFER_NEGATIVE_PATTERN = re.compile(
+    r"^(?:no|no thanks|not now|never mind|don't|do not|skip it)[.! ]*$",
+    re.IGNORECASE,
+)
+OFFER_SUBSTANTIVE_PATTERN = re.compile(
+    r"\b(?:what|why|how|where|when|who|which|explain|define|describe|compare|"
+    r"summarize|tell me about)\b|[?()]",
+    re.IGNORECASE,
 )
 
 GENERAL_REQUEST_PATTERN = re.compile(
@@ -434,8 +486,82 @@ def _rewrite_question(llm, question: str, history: list) -> str:
         | StrOutputParser()
     )
     return rewrite.invoke(
+        {"input": question, "history": history[-config.FOLLOWUP_HISTORY_WINDOW :]}
+    ).strip()
+
+
+def _is_conversation_question(question: str) -> bool:
+    return any(pattern.search(question) for pattern in CONVERSATION_PATTERNS)
+
+
+def _classify_conversation_question(llm, question: str) -> bool:
+    chain = ChatPromptTemplate.from_messages(
+        [
+            ("system", CONVERSATION_CLASSIFIER_SYSTEM),
+            ("human", "{input}"),
+        ]
+    ) | llm | StrOutputParser()
+    answer = chain.invoke({"input": question}).strip()
+    return answer.casefold() == "yes"
+
+
+def _needs_followup_rewrite(question: str) -> bool:
+    return any(pattern.search(question) for pattern in FOLLOWUP_PATTERNS)
+
+
+def _is_affirmative_offer_reply(question: str) -> bool:
+    return bool(OFFER_AFFIRMATIVE_PATTERN.fullmatch(question.strip()))
+
+
+def _is_ambiguous_short_reply(question: str) -> bool:
+    return (
+        0 < len(question.split()) <= 4
+        and not OFFER_NEGATIVE_PATTERN.fullmatch(question.strip())
+        and not OFFER_SUBSTANTIVE_PATTERN.search(question)
+    )
+
+
+def _classify_offer_acceptance(llm, question: str, offered_question: str) -> bool:
+    chain = ChatPromptTemplate.from_messages(
+        [
+            ("system", OFFER_ACCEPTANCE_SYSTEM),
+            (
+                "human",
+                "Offered question: {offered_question}\nStudent's reply: {reply}",
+            ),
+        ]
+    ) | llm | StrOutputParser()
+    answer = chain.invoke(
+        {"offered_question": offered_question, "reply": question}
+    ).strip()
+    return answer.casefold() == "yes"
+
+
+def _conversation_answer(llm, question: str, history: list) -> str:
+    if not any(isinstance(item, HumanMessage) for item in history):
+        return "You haven't asked any earlier questions in this chat."
+    chain = (
+        ChatPromptTemplate.from_messages(
+            [
+                ("system", CONVERSATION_SYSTEM),
+                MessagesPlaceholder("history"),
+                ("human", "{input}"),
+            ]
+        )
+        | llm
+        | StrOutputParser()
+    )
+    return chain.invoke(
         {"input": question, "history": history[-config.HISTORY_WINDOW :]}
     ).strip()
+
+
+def _general_answer(llm, question: str) -> str:
+    chain = ChatPromptTemplate.from_messages(
+        [("system", GENERAL_SYSTEM), ("human", "{input}")]
+    ) | llm | StrOutputParser()
+    answer = chain.invoke({"input": question}).strip()
+    return " ".join(answer.split()[:150])
 
 
 def _answer(llm, question: str, context: str, history: list) -> dict:
@@ -480,20 +606,98 @@ def ask(
     question: str,
     user_id: str = "",
     history: list[dict] | None = None,
+    accept_offer: bool = False,
 ) -> dict:
     key = _session_key(user_id, lecture_id, session_id)
+    history_rows = history or []
     if history is not None:
         messages = []
         for item in history:
-            if item["role"] == "user":
-                messages.append(HumanMessage(content=item["content"]))
-            elif item["role"] == "assistant":
-                messages.append(AIMessage(content=item["content"]))
+            if item.get("role") == "user":
+                messages.append(HumanMessage(content=item.get("content", "")))
+            elif item.get("role") == "assistant":
+                messages.append(AIMessage(content=item.get("content", "")))
         _get_history(key).messages = messages
     chat_history = _get_history(key).messages
     llm = None
+
+    is_conversation_question = _is_conversation_question(question)
+    if (
+        not is_conversation_question
+        and CONVERSATION_CANDIDATE_PATTERN.search(question)
+    ):
+        llm = get_llm(temperature=0)
+        is_conversation_question = with_retry(
+            lambda: _classify_conversation_question(llm, question),
+            tries=1,
+        )
+    if is_conversation_question:
+        recent_history = chat_history[-config.HISTORY_WINDOW :]
+        if any(isinstance(item, HumanMessage) for item in recent_history):
+            llm = llm or get_llm(temperature=0.3)
+            answer = with_retry(
+                lambda: _conversation_answer(llm, question, recent_history),
+                tries=1,
+            )
+        else:
+            answer = _conversation_answer(None, question, recent_history)
+        result = {
+            "answer": answer,
+            "sources": [],
+            "intent": "conversation",
+            "grounded": False,
+        }
+        _get_history(key).add_user_message(question)
+        _get_history(key).add_ai_message(answer)
+        return result
+
+    previous_assistant = next(
+        (item for item in reversed(history_rows) if item.get("role") == "assistant"),
+        None,
+    )
+    pending_offer = (
+        previous_assistant.get("pending_offer")
+        if previous_assistant is not None
+        else None
+    )
+    offer_is_pending = (
+        isinstance(pending_offer, dict)
+        and pending_offer.get("type") == "general_answer"
+        and isinstance(pending_offer.get("question"), str)
+    )
+    accepted_offer = accept_offer or (
+        offer_is_pending and _is_affirmative_offer_reply(question)
+    )
+    if (
+        offer_is_pending
+        and not accepted_offer
+        and _is_ambiguous_short_reply(question)
+    ):
+        llm = get_llm(temperature=0)
+        accepted_offer = with_retry(
+            lambda: _classify_offer_acceptance(
+                llm, question, pending_offer["question"]
+            ),
+            tries=1,
+        )
+    if offer_is_pending and accepted_offer:
+        llm = get_llm(temperature=0.3)
+        answer = with_retry(
+            lambda: _general_answer(llm, pending_offer["question"]), tries=1
+        )
+        result = {
+            "answer": answer,
+            "sources": [],
+            "intent": "general",
+            "grounded": False,
+            "consumed_offer_message_id": previous_assistant.get("id"),
+        }
+        _get_history(key).add_user_message(question)
+        _get_history(key).add_ai_message(answer)
+        return result
+
     standalone = question
-    if chat_history:
+    if chat_history and _needs_followup_rewrite(question):
         llm = get_llm(temperature=0.3)
         standalone = with_retry(
             lambda: _rewrite_question(llm, question, chat_history), tries=1
@@ -572,6 +776,10 @@ def ask(
             "sources": [],
             "intent": "off_topic",
             "grounded": False,
+            "pending_offer": {
+                "type": "general_answer",
+                "question": question,
+            },
         }
     else:
         llm = llm or get_llm(temperature=0.3)
@@ -652,6 +860,11 @@ def ask(
             "intent": intent if grounded else "off_topic",
             "grounded": grounded,
         }
+        if not grounded:
+            result["pending_offer"] = {
+                "type": "general_answer",
+                "question": question,
+            }
 
     _citation_debug("final_sources=%s grounded=%s", result["sources"], result["grounded"])
     _get_history(key).add_user_message(question)

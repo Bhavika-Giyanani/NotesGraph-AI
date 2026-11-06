@@ -110,6 +110,32 @@ def list_folders(user_id: str) -> list:
     )
 
 
+def delete_folder(user_id: str, folder_id: str) -> str:
+    folder = _one(
+        client()
+        .table("folders")
+        .select("id")
+        .eq("id", folder_id)
+        .eq("user_id", user_id)
+    )
+    if folder is None:
+        return "not_found"
+    lectures = (
+        client()
+        .table("lectures")
+        .select("id", count="exact")
+        .eq("folder_id", folder_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    if lectures.count:
+        return "not_empty"
+    client().table("folders").delete().eq("id", folder_id).eq(
+        "user_id", user_id
+    ).execute()
+    return "deleted"
+
+
 def save_transcript(
     lecture_id: str, user_id: str, text: str, segments: Optional[list[dict]] = None
 ) -> None:
@@ -201,7 +227,7 @@ def get_chat_messages(session_id: str, user_id: str) -> list:
     return (
         client()
         .table("chat_messages")
-        .select("id,role,content,sources,status,intent,grounded,created_at")
+        .select("id,role,content,sources,status,intent,grounded,pending_offer,created_at")
         .eq("session_id", session_id)
         .eq("user_id", user_id)
         .order("id")
@@ -280,6 +306,7 @@ def complete_chat_reply(
     sources: list,
     intent: str,
     grounded: bool,
+    pending_offer: Optional[dict] = None,
 ) -> None:
     result = (
         client()
@@ -290,6 +317,7 @@ def complete_chat_reply(
                 "sources": sources or [],
                 "intent": intent,
                 "grounded": grounded,
+                "pending_offer": pending_offer,
                 "status": "complete",
             }
         )
@@ -301,6 +329,12 @@ def complete_chat_reply(
     )
     if not result.data:
         raise KeyError(message_id)
+
+
+def clear_pending_offer(message_id: int, session_id: str, user_id: str) -> None:
+    client().table("chat_messages").update({"pending_offer": None}).eq(
+        "id", message_id
+    ).eq("session_id", session_id).eq("user_id", user_id).execute()
 
 
 def fail_chat_reply(message_id: int, session_id: str, user_id: str) -> None:
@@ -356,6 +390,7 @@ def add_chat_messages(
                 "sources": normalized_sources,
                 "intent": intent,
                 "grounded": grounded,
+                "pending_offer": None,
             },
         ]
     ).execute()
@@ -366,6 +401,15 @@ def add_chat_messages(
 
 def clear_chat_session(session_id: str, user_id: str) -> None:
     client().table("chat_messages").delete().eq("session_id", session_id).eq("user_id", user_id).execute()
+
+
+def delete_chat_session(session_id: str, user_id: str) -> bool:
+    if get_chat_session(session_id, user_id) is None:
+        return False
+    client().table("chat_sessions").delete().eq("id", session_id).eq(
+        "user_id", user_id
+    ).execute()
+    return True
 
 
 def delete(lecture_id: str, user_id: str) -> None:

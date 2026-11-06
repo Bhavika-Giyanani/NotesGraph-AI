@@ -53,6 +53,12 @@ class Notes(BaseModel):
 class ChatRequest(BaseModel):
     session_id: str = Field(min_length=1, max_length=100)
     message: str = Field(min_length=1, max_length=4000)
+    accept_offer: bool = False
+
+
+class PendingOffer(BaseModel):
+    type: Literal["general_answer"]
+    question: str
 
 
 class ChatSource(BaseModel):
@@ -69,8 +75,11 @@ class ChatMessage(BaseModel):
     created_at: str
     sources: List[ChatSource] = Field(default_factory=list)
     status: Optional[Literal["pending", "complete", "error"]] = None
-    intent: Optional[Literal["locate", "explain", "off_topic"]] = None
+    intent: Optional[
+        Literal["locate", "explain", "off_topic", "conversation", "general"]
+    ] = None
     grounded: Optional[bool] = None
+    pending_offer: Optional[PendingOffer] = None
 
 
 class ChatTurn(BaseModel):

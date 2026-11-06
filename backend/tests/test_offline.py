@@ -170,6 +170,365 @@ def test_off_topic_has_no_sources_and_is_not_grounded(monkeypatch):
     assert result["sources"] == []
     assert result["grounded"] is False
     assert result["intent"] == "off_topic"
+    assert result["pending_offer"] == {
+        "type": "general_answer",
+        "question": "What is quantum computing?",
+    }
+
+
+def test_conversation_question_answers_from_history_without_retrieval(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(
+        messages=iter([AIMessage(content="You asked what deadlock is.")])
+    )
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda *_: (_ for _ in ()).throw(AssertionError("conversation must not retrieve")),
+    )
+
+    result = rag.ask(
+        "lec-history",
+        "session-history",
+        "What did I ask you previously?",
+        history=[
+            {"id": 1, "role": "user", "content": "What is deadlock?"},
+            {"id": 2, "role": "assistant", "content": "Deadlock is a waiting condition."},
+        ],
+    )
+
+    assert "deadlock" in result["answer"].lower()
+    assert result["sources"] == []
+    assert result["intent"] == "conversation"
+    assert result["grounded"] is False
+
+
+def test_ambiguous_conversation_question_uses_classifier_before_retrieval(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(content="YES"),
+                AIMessage(content="You asked about deadlock."),
+            ]
+        )
+    )
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda *_: (_ for _ in ()).throw(AssertionError("conversation must not retrieve")),
+    )
+
+    result = rag.ask(
+        "lec-conversation-classifier",
+        "session-conversation-classifier",
+        "Can you recap?",
+        history=[
+            {"id": 1, "role": "user", "content": "What is deadlock?"},
+            {"id": 2, "role": "assistant", "content": "Deadlock has four conditions."},
+        ],
+    )
+
+    assert result["intent"] == "conversation"
+    assert "deadlock" in result["answer"].lower()
+
+
+def test_first_conversation_question_says_no_earlier_questions(monkeypatch):
+    from app import rag
+
+    monkeypatch.setattr(
+        rag,
+        "get_llm",
+        lambda **_: (_ for _ in ()).throw(AssertionError("no history needs no model")),
+    )
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda *_: (_ for _ in ()).throw(AssertionError("conversation must not retrieve")),
+    )
+
+    result = rag.ask(
+        "lec-new-chat", "session-new-chat", "What did I ask before?"
+    )
+
+    assert "haven't asked" in result["answer"]
+    assert result["sources"] == []
+    assert result["intent"] == "conversation"
+
+
+def test_followup_rewrite_uses_deadlock_history(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(content="Explain deadlock in simpler terms"),
+                AIMessage(
+                    content='{"answer":"Deadlock is when processes wait on one another.","grounded":true,"supporting_snippet_ids":[0]}'
+                ),
+            ]
+        )
+    )
+    retrieved = []
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda question, *_: retrieved.append(question)
+        or [_citation_doc(60, 70, "Deadlock requires four conditions.")],
+    )
+    monkeypatch.setattr(
+        rag.store,
+        "load_transcript_segments",
+        lambda *_: [{"start": 0, "end": 1000, "text": "lecture"}],
+    )
+
+    result = rag.ask(
+        "lec-deadlock-followup",
+        "session-deadlock-followup",
+        "Explain that simply",
+        history=[
+            {"id": 1, "role": "user", "content": "What is deadlock?"},
+            {"id": 2, "role": "assistant", "content": "Deadlock has four conditions."},
+        ],
+    )
+
+    assert retrieved == ["Explain deadlock in simpler terms"]
+    assert result["intent"] == "explain"
+    assert result["grounded"] is True
+
+
+def test_unrelated_question_after_history_is_not_rewritten(monkeypatch):
+    from app import rag
+
+    retrieved = []
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda question, *_: retrieved.append(question)
+        or [_citation_doc(0, 5, "Deadlock has four conditions.", 0.1)],
+    )
+    monkeypatch.setattr(
+        rag,
+        "get_llm",
+        lambda **_: (_ for _ in ()).throw(AssertionError("off-topic gate skips model")),
+    )
+
+    result = rag.ask(
+        "lec-unrelated",
+        "session-unrelated",
+        "What is the capital of France?",
+        history=[
+            {"id": 1, "role": "user", "content": "What is deadlock?"},
+            {"id": 2, "role": "assistant", "content": "Deadlock has four conditions."},
+        ],
+    )
+
+    assert retrieved == ["What is the capital of France?"]
+    assert result["intent"] == "off_topic"
+
+
+def test_offer_acceptance_returns_general_answer_without_retrieval(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(
+        messages=iter([AIMessage(content="Accumulate combines a sequence of values.")])
+    )
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda *_: (_ for _ in ()).throw(AssertionError("general answer must not retrieve")),
+    )
+
+    result = rag.ask(
+        "lec-general-offer",
+        "session-general-offer",
+        "Go ahead",
+        history=[
+            {
+                "id": 22,
+                "role": "assistant",
+                "content": "This lecture doesn't appear to cover that topic.",
+                "pending_offer": {
+                    "type": "general_answer",
+                    "question": "What is accumulate() in STL C++?",
+                },
+            }
+        ],
+    )
+
+    assert result["intent"] == "general"
+    assert result["grounded"] is False
+    assert result["sources"] == []
+    assert result["answer"]
+    assert "not cover" not in result["answer"].lower()
+    assert result["consumed_offer_message_id"] == 22
+
+
+def test_ambiguous_short_offer_reply_uses_llm_fallback(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(content="YES"),
+                AIMessage(content="Accumulate combines values in a sequence."),
+            ]
+        )
+    )
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda *_: (_ for _ in ()).throw(AssertionError("accepted offer must not retrieve")),
+    )
+
+    result = rag.ask(
+        "lec-ambiguous-offer",
+        "session-ambiguous-offer",
+        "That sounds helpful",
+        history=[
+            {
+                "id": 31,
+                "role": "assistant",
+                "content": "Would you like a general answer?",
+                "pending_offer": {
+                    "type": "general_answer",
+                    "question": "What is accumulate() in STL C++?",
+                },
+            }
+        ],
+    )
+
+    assert result["intent"] == "general"
+    assert result["sources"] == []
+    assert result["answer"]
+
+
+def test_go_ahead_without_pending_offer_is_a_normal_question(monkeypatch):
+    from app import rag
+
+    retrieved = []
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda question, *_: retrieved.append(question)
+        or [_citation_doc(0, 5, "Deadlock has four conditions.", 0.1)],
+    )
+    monkeypatch.setattr(
+        rag,
+        "get_llm",
+        lambda **_: (_ for _ in ()).throw(AssertionError("off-topic gate skips model")),
+    )
+
+    result = rag.ask(
+        "lec-no-offer",
+        "session-no-offer",
+        "Go ahead",
+        history=[
+            {"id": 1, "role": "assistant", "content": "Hello.", "pending_offer": None}
+        ],
+    )
+
+    assert retrieved == ["Go ahead"]
+    assert result["intent"] == "off_topic"
+    assert result["pending_offer"]["question"] == "Go ahead"
+
+
+def test_new_on_topic_question_ignores_unanswered_offer(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content='{"answer":"Deadlock requires four conditions.","grounded":true,"supporting_snippet_ids":[0]}'
+                )
+            ]
+        )
+    )
+    retrieved = []
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda question, *_: retrieved.append(question)
+        or [_citation_doc(60, 70, "Deadlock requires four conditions.")],
+    )
+    monkeypatch.setattr(
+        rag.store,
+        "load_transcript_segments",
+        lambda *_: [{"start": 0, "end": 1000, "text": "lecture"}],
+    )
+
+    result = rag.ask(
+        "lec-new-question",
+        "session-new-question",
+        "What are the deadlock conditions?",
+        history=[
+            {"id": 1, "role": "user", "content": "What is C++ accumulate?"},
+            {
+                "id": 2,
+                "role": "assistant",
+                "content": "Not covered.",
+                "pending_offer": {
+                    "type": "general_answer",
+                    "question": "What is C++ accumulate?",
+                },
+            },
+        ],
+    )
+
+    assert retrieved == ["What are the deadlock conditions?"]
+    assert result["intent"] == "explain"
+    assert result["grounded"] is True
+
+
+def test_offer_cannot_be_accepted_twice(monkeypatch):
+    from app import rag
+
+    retrieved = []
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda question, *_: retrieved.append(question)
+        or [_citation_doc(0, 5, "Deadlock has four conditions.", 0.1)],
+    )
+    monkeypatch.setattr(
+        rag,
+        "get_llm",
+        lambda **_: (_ for _ in ()).throw(AssertionError("off-topic gate skips model")),
+    )
+
+    result = rag.ask(
+        "lec-used-offer",
+        "session-used-offer",
+        "Go ahead",
+        history=[
+            {
+                "id": 2,
+                "role": "assistant",
+                "content": "Would you like a general answer?",
+                "pending_offer": None,
+            },
+            {"id": 3, "role": "user", "content": "Go ahead"},
+            {
+                "id": 4,
+                "role": "assistant",
+                "content": "Accumulate combines values.",
+                "intent": "general",
+                "pending_offer": None,
+            },
+        ],
+    )
+
+    assert retrieved == ["Go ahead"]
+    assert result["intent"] == "off_topic"
 
 
 def test_lexical_gate_rejects_high_similarity_unrelated_chunks(monkeypatch):
@@ -583,6 +942,79 @@ def test_chat_messages_always_include_non_null_sources(monkeypatch):
     assert [row["sources"] for row in captured["rows"]] == [[], []]
 
 
+def test_complete_chat_reply_persists_pending_offer(monkeypatch):
+    from app import store
+
+    captured = {}
+
+    class Query:
+        def update(self, fields):
+            captured["fields"] = fields
+            return self
+
+        def eq(self, *_):
+            return self
+
+        def execute(self):
+            return type("Result", (), {"data": [{"id": 8}]})()
+
+    class Client:
+        def table(self, _):
+            return Query()
+
+    monkeypatch.setattr(store, "client", lambda: Client())
+    offer = {
+        "type": "general_answer",
+        "question": "What is accumulate() in STL C++?",
+    }
+
+    store.complete_chat_reply(
+        8,
+        "session1",
+        "user1",
+        "This lecture doesn't appear to cover that topic.",
+        [],
+        "off_topic",
+        False,
+        offer,
+    )
+
+    assert captured["fields"]["pending_offer"] == offer
+    assert captured["fields"]["intent"] == "off_topic"
+
+
+def test_segments_and_delete_routes_are_owner_scoped(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main, store
+
+    monkeypatch.setattr(store, "get", lambda lecture_id, user_id: {"id": lecture_id})
+    monkeypatch.setattr(store, "load_transcript", lambda *_: "saved transcript")
+    monkeypatch.setattr(
+        store,
+        "load_transcript_segments",
+        lambda *_: [
+            {"start": 2, "end": 4, "text": "Timed segment", "private": "omit"}
+        ],
+    )
+    delete_folder_result = {"value": "not_empty"}
+    monkeypatch.setattr(
+        store, "delete_folder", lambda *_: delete_folder_result["value"]
+    )
+    monkeypatch.setattr(store, "delete_chat_session", lambda *_: True)
+    monkeypatch.setitem(
+        main.app.dependency_overrides, main.auth.current_user, lambda: "owner"
+    )
+    client = TestClient(main.app)
+
+    segments = client.get("/api/lectures/lecture1/segments")
+    assert segments.status_code == 200
+    assert segments.json() == [{"start": 2, "end": 4, "text": "Timed segment"}]
+    assert client.delete("/api/folders/folder1").status_code == 409
+    delete_folder_result["value"] = "deleted"
+    assert client.delete("/api/folders/folder1").status_code == 204
+    assert client.delete("/api/chat-sessions/session1").status_code == 204
+
+
 def test_failed_background_chat_is_saved_as_terminal_error(monkeypatch):
     from app import main, rag, store
 
@@ -609,7 +1041,7 @@ def test_missing_chat_metadata_columns_return_migration_guidance():
     error = RuntimeError("{'message': 'column chat_messages.grounded does not exist', 'code': '42703'}")
 
     assert _is_missing_chat_schema_column(error)
-    assert "20261106_chat_grounding_metadata.sql" in _chat_schema_migration_error().detail
+    assert "20261106_chat_pending_offer_and_intents.sql" in _chat_schema_migration_error().detail
     assert _is_missing_chat_schema_column(
         RuntimeError("{'message': 'column chat_messages.status does not exist', 'code': '42703'}")
     )
@@ -724,9 +1156,18 @@ def test_api_flow(monkeypatch):
         chat_messages[session_id].extend([user_row, assistant_row])
         return user_row, assistant_row
 
-    def fake_complete_chat_reply(message_id, session_id, user_id, answer, sources, intent, grounded):
+    def fake_complete_chat_reply(
+        message_id, session_id, user_id, answer, sources, intent, grounded, pending_offer=None
+    ):
         row = next(message for message in chat_messages[session_id] if message["id"] == message_id)
-        row.update(content=answer, sources=sources, intent=intent, grounded=grounded, status="complete")
+        row.update(
+            content=answer,
+            sources=sources,
+            intent=intent,
+            grounded=grounded,
+            pending_offer=pending_offer,
+            status="complete",
+        )
 
     def fake_fail_chat_reply(message_id, session_id, user_id):
         row = next(message for message in chat_messages[session_id] if message["id"] == message_id)
