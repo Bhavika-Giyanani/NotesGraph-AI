@@ -492,17 +492,12 @@ def test_new_on_topic_question_ignores_unanswered_offer(monkeypatch):
 def test_offer_cannot_be_accepted_twice(monkeypatch):
     from app import rag
 
-    retrieved = []
+    llm = GenericFakeChatModel(messages=iter([AIMessage(content="Please say what topic you mean.")]))
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
     monkeypatch.setattr(
         rag,
         "_retrieve",
-        lambda question, *_: retrieved.append(question)
-        or [_citation_doc(0, 5, "Deadlock has four conditions.", 0.1)],
-    )
-    monkeypatch.setattr(
-        rag,
-        "get_llm",
-        lambda **_: (_ for _ in ()).throw(AssertionError("off-topic gate skips model")),
+        lambda *_: (_ for _ in ()).throw(AssertionError("general thread must not retrieve")),
     )
 
     result = rag.ask(
@@ -527,8 +522,8 @@ def test_offer_cannot_be_accepted_twice(monkeypatch):
         ],
     )
 
-    assert retrieved == ["Go ahead"]
-    assert result["intent"] == "off_topic"
+    assert result["intent"] == "general"
+    assert "consumed_offer_message_id" not in result
 
 
 def test_lexical_gate_rejects_high_similarity_unrelated_chunks(monkeypatch):
@@ -548,6 +543,189 @@ def test_lexical_gate_rejects_high_similarity_unrelated_chunks(monkeypatch):
     assert result["sources"] == []
     assert result["grounded"] is False
     assert result["intent"] == "off_topic"
+
+
+def test_explicit_general_request_skips_retrieval_and_offer(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(
+        messages=iter(
+            [AIMessage(content="std::accumulate combines values in a sequence.")]
+        )
+    )
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda *_: (_ for _ in ()).throw(AssertionError("explicit general request must not retrieve")),
+    )
+
+    result = rag.ask(
+        "lec-explicit-general",
+        "session-explicit-general",
+        "I know accumulate() of C++ STL is not part of this lecture, tell me about that.",
+    )
+
+    assert result["intent"] == "general"
+    assert result["grounded"] is False
+    assert result["sources"] == []
+    assert "accumulate" in result["answer"].lower()
+    assert "pending_offer" not in result
+
+
+def test_general_thread_followup_rewrites_and_answers_from_history(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(content="Explain std::accumulate in simpler words"),
+                AIMessage(
+                    content="std::accumulate adds values in a range, like summing a list of numbers."
+                ),
+            ]
+        )
+    )
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda *_: (_ for _ in ()).throw(AssertionError("general thread must not retrieve")),
+    )
+
+    result = rag.ask(
+        "lec-general-thread",
+        "session-general-thread",
+        "Explain this in more easy words",
+        history=[
+            {
+                "id": 1,
+                "role": "user",
+                "content": "I know accumulate() isn't part of the lecture, tell me about it.",
+            },
+            {
+                "id": 2,
+                "role": "assistant",
+                "content": "std::accumulate combines values.",
+                "intent": "general",
+                "grounded": False,
+            },
+        ],
+    )
+
+    assert result["intent"] == "general"
+    assert result["grounded"] is False
+    assert result["sources"] == []
+    assert "adds values" in result["answer"]
+
+
+def test_standalone_nonlecture_question_stays_in_general_thread(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(
+        messages=iter([AIMessage(content="Gravity is the attraction between masses.")])
+    )
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda *_: (_ for _ in ()).throw(AssertionError("general thread must not retrieve")),
+    )
+
+    result = rag.ask(
+        "lec-general-thread-new-topic",
+        "session-general-thread-new-topic",
+        "What is gravity?",
+        history=[
+            {"id": 1, "role": "user", "content": "Tell me about accumulate outside the lecture."},
+            {
+                "id": 2,
+                "role": "assistant",
+                "content": "Accumulate adds values.",
+                "intent": "general",
+            },
+        ],
+    )
+
+    assert result["intent"] == "general"
+    assert result["sources"] == []
+    assert "gravity" in result["answer"].lower()
+
+
+def test_lecture_locate_question_exits_general_thread(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content='{"answer":"Deadlock is discussed here.","grounded":true,"supporting_snippet_ids":[0]}'
+                )
+            ]
+        )
+    )
+    retrieved = []
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda question, *_: retrieved.append(question)
+        or [_citation_doc(60, 70, "Deadlock needs four conditions.")],
+    )
+    monkeypatch.setattr(
+        rag.store,
+        "load_transcript_segments",
+        lambda *_: [{"start": 0, "end": 1000, "text": "lecture"}],
+    )
+
+    result = rag.ask(
+        "lec-general-to-lecture",
+        "session-general-to-lecture",
+        "Where does the lecture discuss deadlock?",
+        history=[
+            {"id": 1, "role": "user", "content": "Tell me about accumulate outside the lecture."},
+            {
+                "id": 2,
+                "role": "assistant",
+                "content": "Accumulate adds values.",
+                "intent": "general",
+            },
+        ],
+    )
+
+    assert retrieved == ["Where does the lecture discuss deadlock?"]
+    assert result["intent"] == "locate"
+    assert result["grounded"] is True
+
+
+def test_pending_offer_stores_rewritten_standalone_question(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(
+        messages=iter([AIMessage(content="What is quantum computing?")])
+    )
+    retrieved = []
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda question, *_: retrieved.append(question)
+        or [_citation_doc(0, 5, "Lecture excerpt.", similarity=0.1)],
+    )
+
+    result = rag.ask(
+        "lec-rewritten-offer",
+        "session-rewritten-offer",
+        "Explain that simply",
+        history=[
+            {"id": 1, "role": "user", "content": "What is quantum computing?"},
+            {"id": 2, "role": "assistant", "content": "I can explain that."},
+        ],
+    )
+
+    assert retrieved == ["What is quantum computing?"]
+    assert result["intent"] == "off_topic"
+    assert result["pending_offer"]["question"] == "What is quantum computing?"
 
 
 def test_locate_merges_nearby_hits_and_sorts_ranges(monkeypatch):

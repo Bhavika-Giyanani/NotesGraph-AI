@@ -38,8 +38,9 @@ ANSWER_SYSTEM = (
 )
 
 GENERAL_SYSTEM = (
-    "Answer the student's question in at most 150 words using general knowledge, not the lecture. "
-    "Do not invent citations or timestamps."
+    "Answer using general knowledge, not the lecture. Use about 150 words or fewer unless the "
+    "student explicitly asks for more detail. Use the recent conversation to resolve references "
+    "to previous general answers. Do not invent citations or timestamps."
 )
 
 CONVERSATION_SYSTEM = (
@@ -101,7 +102,34 @@ OFFER_SUBSTANTIVE_PATTERN = re.compile(
 )
 
 GENERAL_REQUEST_PATTERN = re.compile(
-    r"\b(?:in general|generally|outside (?:of )?(?:the )?lecture|general explanation|general answer)\b",
+    r"\b(?:not\s+(?:a\s+)?part\s+of\s+(?:the\s+)?(?:this\s+)?lecture|"
+    r"not\s+in\s+(?:the\s+)?(?:this\s+)?lecture|outside\s+(?:of\s+)?(?:the\s+)?lecture|"
+    r"not\s+from\s+(?:the\s+)?lecture|in\s+general|generally|"
+    r"general\s+(?:explanation|answer|knowledge))\b",
+    re.IGNORECASE,
+)
+GENERAL_REQUEST_CANDIDATE_PATTERN = re.compile(
+    r"\b(?:not\s+(?:covered|part|mentioned|included)|outside\s+(?:of\s+)?(?:the\s+)?lecture|"
+    r"not\s+from\s+(?:the\s+)?lecture|tell\s+me\s+about|explain\s+generally)\b",
+    re.IGNORECASE,
+)
+GENERAL_CLASSIFIER_SYSTEM = (
+    "Decide whether the student explicitly asks for an answer from general knowledge rather than "
+    "from the lecture. Reply with exactly YES or NO. Mere mention that a topic may be absent from "
+    "the lecture is not enough unless the student requests an explanation."
+)
+GENERAL_THREAD_FOLLOWUP_PATTERNS = (
+    re.compile(r"\b(?:this|that|it|them|these|those)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:simpler|more\s+simply|easy\s+words?|simple\s+words?|"
+        r"(?:an?\s+)?example|more\s+detail|explain\s+again|again|shorter|"
+        r"elaborate|expand\s+(?:on\s+)?that)\b",
+        re.IGNORECASE,
+    ),
+)
+MORE_DETAIL_PATTERN = re.compile(
+    r"\b(?:more\s+detail|in\s+more\s+detail|elaborate|expand|in\s+depth|"
+    r"comprehensive|longer|go\s+deeper)\b",
     re.IGNORECASE,
 )
 
@@ -506,7 +534,61 @@ def _classify_conversation_question(llm, question: str) -> bool:
 
 
 def _needs_followup_rewrite(question: str) -> bool:
-    return any(pattern.search(question) for pattern in FOLLOWUP_PATTERNS)
+    return any(
+        pattern.search(question)
+        for pattern in (*FOLLOWUP_PATTERNS, *GENERAL_THREAD_FOLLOWUP_PATTERNS)
+    )
+
+
+def _is_general_thread_followup(question: str) -> bool:
+    return (
+        len(question.split()) <= 12
+        and any(
+            pattern.search(question) for pattern in GENERAL_THREAD_FOLLOWUP_PATTERNS
+        )
+    )
+
+
+def _is_clearly_lecture_related(question: str) -> bool:
+    if re.search(
+        r"\b(?:lecture|recording|speaker|professor|class)\b",
+        question,
+        re.IGNORECASE,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\bwhere\b.{0,70}\b(?:discuss|mention|cover|explain|introduce|"
+            r"talk(?:ed)?\s+about)\b",
+            question,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _classify_general_request(llm, question: str) -> bool:
+    chain = ChatPromptTemplate.from_messages(
+        [("system", GENERAL_CLASSIFIER_SYSTEM), ("human", "{input}")]
+    ) | llm | StrOutputParser()
+    answer = chain.invoke({"input": question}).strip()
+    return answer.casefold() == "yes"
+
+
+def _is_explicit_general_request(question: str) -> bool:
+    if GENERAL_REQUEST_PATTERN.search(question):
+        return True
+    acknowledges_absence = re.search(
+        r"\b(?:not\s+covered|isn't\s+covered|not\s+part\s+of|isn't\s+part\s+of|"
+        r"not\s+in\s+(?:the\s+)?lecture|outside\s+(?:the\s+)?lecture)\b",
+        question,
+        re.IGNORECASE,
+    )
+    asks_for_explanation = re.search(
+        r"\b(?:tell\s+me\s+about|explain|describe|what\s+is|how\s+does)\b",
+        question,
+        re.IGNORECASE,
+    )
+    return bool(acknowledges_absence and asks_for_explanation)
 
 
 def _is_affirmative_offer_reply(question: str) -> bool:
@@ -556,12 +638,21 @@ def _conversation_answer(llm, question: str, history: list) -> str:
     ).strip()
 
 
-def _general_answer(llm, question: str) -> str:
-    chain = ChatPromptTemplate.from_messages(
-        [("system", GENERAL_SYSTEM), ("human", "{input}")]
-    ) | llm | StrOutputParser()
-    answer = chain.invoke({"input": question}).strip()
-    return " ".join(answer.split()[:150])
+def _general_answer(llm, question: str, history: list | None = None) -> str:
+    messages = [("system", GENERAL_SYSTEM)]
+    if history:
+        messages.append(MessagesPlaceholder("history"))
+    messages.append(("human", "{input}"))
+    chain = ChatPromptTemplate.from_messages(messages) | llm | StrOutputParser()
+    answer = chain.invoke(
+        {
+            "input": question,
+            "history": (history or [])[-config.FOLLOWUP_HISTORY_WINDOW :],
+        }
+    ).strip()
+    if not MORE_DETAIL_PATTERN.search(question):
+        return " ".join(answer.split()[:150])
+    return answer
 
 
 def _answer(llm, question: str, context: str, history: list) -> dict:
@@ -683,7 +774,12 @@ def ask(
     if offer_is_pending and accepted_offer:
         llm = get_llm(temperature=0.3)
         answer = with_retry(
-            lambda: _general_answer(llm, pending_offer["question"]), tries=1
+            lambda: _general_answer(
+                llm,
+                pending_offer["question"],
+                chat_history[-config.FOLLOWUP_HISTORY_WINDOW :],
+            ),
+            tries=1,
         )
         result = {
             "answer": answer,
@@ -691,6 +787,71 @@ def ask(
             "intent": "general",
             "grounded": False,
             "consumed_offer_message_id": previous_assistant.get("id"),
+        }
+        _get_history(key).add_user_message(question)
+        _get_history(key).add_ai_message(answer)
+        return result
+
+    explicit_general = _is_explicit_general_request(question)
+    if (
+        not explicit_general
+        and GENERAL_REQUEST_CANDIDATE_PATTERN.search(question)
+    ):
+        llm = get_llm(temperature=0)
+        explicit_general = with_retry(
+            lambda: _classify_general_request(llm, question),
+            tries=1,
+        )
+    if explicit_general:
+        llm = llm or get_llm(temperature=0.3)
+        answer = with_retry(
+            lambda: _general_answer(
+                llm,
+                question,
+                chat_history[-config.FOLLOWUP_HISTORY_WINDOW :],
+            ),
+            tries=1,
+        )
+        result = {
+            "answer": answer,
+            "sources": [],
+            "intent": "general",
+            "grounded": False,
+        }
+        _get_history(key).add_user_message(question)
+        _get_history(key).add_ai_message(answer)
+        return result
+
+    previous_assistant = next(
+        (item for item in reversed(history_rows) if item.get("role") == "assistant"),
+        None,
+    )
+    in_general_thread = (
+        previous_assistant is not None
+        and previous_assistant.get("intent") == "general"
+        and not _is_clearly_lecture_related(question)
+    )
+    if in_general_thread:
+        llm = llm or get_llm(temperature=0.3)
+        standalone_general = question
+        if _is_general_thread_followup(question):
+            standalone_general = with_retry(
+                lambda: _rewrite_question(llm, question, chat_history),
+                tries=1,
+            )
+        answer = with_retry(
+            lambda: _general_answer(
+                llm,
+                standalone_general,
+                chat_history[-config.FOLLOWUP_HISTORY_WINDOW :],
+            ),
+            tries=1,
+        )
+        result = {
+            "answer": answer,
+            "sources": [],
+            "intent": "general",
+            "grounded": False,
         }
         _get_history(key).add_user_message(question)
         _get_history(key).add_ai_message(answer)
@@ -758,19 +919,6 @@ def ask(
         or not grounded_docs
     ):
         answer = "This lecture doesn't appear to cover that topic. Ask if you'd like a short general explanation."
-        if GENERAL_REQUEST_PATTERN.search(question):
-            llm = llm or get_llm(temperature=0.3)
-            general = (
-                ChatPromptTemplate.from_messages(
-                    [("system", GENERAL_SYSTEM), ("human", "{input}")]
-                )
-                | llm
-                | StrOutputParser()
-            )
-            general_answer = with_retry(
-                lambda: general.invoke({"input": question}), tries=1
-            ).strip()
-            answer = f"{answer}\n\nOutside the lecture: {general_answer}"
         result = {
             "answer": answer,
             "sources": [],
@@ -778,7 +926,7 @@ def ask(
             "grounded": False,
             "pending_offer": {
                 "type": "general_answer",
-                "question": question,
+                "question": standalone,
             },
         }
     else:
@@ -800,19 +948,6 @@ def ask(
                 "This lecture doesn't appear to cover that topic. "
                 "Ask if you'd like a short general explanation."
             )
-            if GENERAL_REQUEST_PATTERN.search(question):
-                general = (
-                    ChatPromptTemplate.from_messages(
-                        [("system", GENERAL_SYSTEM), ("human", "{input}")]
-                    )
-                    | llm
-                    | StrOutputParser()
-                )
-                general_answer = with_retry(
-                    lambda: general.invoke({"input": question}), tries=1
-                ).strip()
-                answer = f"{answer}\n\nOutside the lecture: {general_answer}"
-
         lecture_segments = store.load_transcript_segments(lecture_id, user_id)
         duration = max(
             (
@@ -863,7 +998,7 @@ def ask(
         if not grounded:
             result["pending_offer"] = {
                 "type": "general_answer",
-                "question": question,
+                "question": standalone,
             }
 
     _citation_debug("final_sources=%s grounded=%s", result["sources"], result["grounded"])
