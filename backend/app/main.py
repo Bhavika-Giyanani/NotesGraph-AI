@@ -262,6 +262,30 @@ def process_indexing(lecture_id: str, user_id: str) -> None:
             log.exception("Could not save chat indexing error for lecture %s", lecture_id)
 
 
+def _schedule_indexing(lecture_id: str, user_id: str, progress: str) -> dict:
+    store.update(lecture_id, user_id, status="indexing", progress=progress, error="")
+    task = asyncio.create_task(
+        asyncio.to_thread(process_indexing, lecture_id, user_id),
+        name=f"index-lecture-{lecture_id}",
+    )
+    _processing_tasks.add(task)
+
+    def finished(completed: asyncio.Task) -> None:
+        _processing_tasks.discard(completed)
+        if completed.cancelled():
+            log.warning("Chat indexing task cancelled for lecture %s", lecture_id)
+        elif error := completed.exception():
+            log.error(
+                "Unexpected chat indexing task failure for lecture %s",
+                lecture_id,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(finished)
+    log.info("Scheduled chat indexing for lecture %s", lecture_id)
+    return store.get(lecture_id, user_id)
+
+
 def process_chat_answer(
     lecture_id: str,
     session_id: str,
@@ -641,27 +665,22 @@ async def retry_index(lecture_id: str, user_id: str = Depends(auth.current_user)
     meta = _require(lecture_id, user_id)
     if meta["status"] != "index_error":
         raise HTTPException(409, "Chat indexing does not need a retry.")
-    store.update(lecture_id, user_id, status="indexing", progress="Retrying chat indexing", error="")
-    task = asyncio.create_task(
-        asyncio.to_thread(process_indexing, lecture_id, user_id),
-        name=f"index-lecture-{lecture_id}",
-    )
-    _processing_tasks.add(task)
+    return _schedule_indexing(lecture_id, user_id, "Retrying chat indexing")
 
-    def finished(completed: asyncio.Task) -> None:
-        _processing_tasks.discard(completed)
-        if completed.cancelled():
-            log.warning("Chat indexing task cancelled for lecture %s", lecture_id)
-        elif error := completed.exception():
-            log.error(
-                "Unexpected chat indexing task failure for lecture %s",
-                lecture_id,
-                exc_info=(type(error), error, error.__traceback__),
-            )
 
-    task.add_done_callback(finished)
-    log.info("Scheduled chat indexing retry for lecture %s", lecture_id)
-    return store.get(lecture_id, user_id)
+@app.post("/api/lectures/{lecture_id}/reindex", status_code=202)
+async def reindex_lecture(lecture_id: str, user_id: str = Depends(auth.current_user)):
+    meta = _require(lecture_id, user_id)
+    if meta["status"] not in ("done", "index_error"):
+        raise HTTPException(409, "Only a completed lecture can be reindexed.")
+    if not store.load_transcript(lecture_id, user_id):
+        raise HTTPException(409, "The stored transcript is missing; this lecture cannot be reindexed.")
+    if not store.load_transcript_segments(lecture_id, user_id):
+        raise HTTPException(
+            409,
+            "Stored Whisper segments are missing; reindexing cannot create timestamps without retranscription.",
+        )
+    return _schedule_indexing(lecture_id, user_id, "Rebuilding citation index")
 
 
 @app.get("/api/chat-sessions")

@@ -28,6 +28,4 @@ def get_embeddings() -> GoogleGenerativeAIEmbeddings:
     model = config.EMBEDDING_MODEL
     if not model.startswith("models/"):
         model = f"models/{model}"
-    return GoogleGenerativeAIEmbeddings(
-        model=model, google_api_key=config.GOOGLE_API_KEY, output_dimensionality=768
-    )
+    return GoogleGenerativeAIEmbeddings(model=model, google_api_key=config.GOOGLE_API_KEY)

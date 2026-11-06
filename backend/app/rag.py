@@ -1,6 +1,8 @@
 """Supabase pgvector retrieval and isolated, persistent-session chat."""
+import json
 import logging
 import re
+import statistics
 from typing import Dict
 
 from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
@@ -23,9 +25,15 @@ REWRITE_SYSTEM = (
 )
 
 ANSWER_SYSTEM = (
-    "You are a study assistant answering questions about ONE lecture, using the lecture excerpts below.\n"
-    "- Answer only from the excerpts and be clear and concise.\n"
-    "- Do not generate timestamps, citations, or source labels.\n\n"
+    "You are a study assistant answering questions about ONE lecture, using the numbered snippets below.\n"
+    "- Return only valid JSON with exactly these fields: answer (string), grounded (boolean), "
+    "supporting_snippet_ids (array of integer snippet IDs).\n"
+    "- Set grounded=true only if the snippets directly answer the student's question. "
+    "Select only IDs for snippets that support your answer. If none answer it, set grounded=false "
+    "and supporting_snippet_ids=[].\n"
+    "- When grounded=false, say the lecture doesn't appear to cover the question. "
+    "Give general knowledge only when the student explicitly asks for it.\n"
+    "- Never include timestamps, citations, or source labels. Do not invent snippet IDs.\n\n"
     "Lecture excerpts:\n{context}"
 )
 
@@ -56,6 +64,40 @@ _STOP_WORDS = {
 }
 
 _histories: Dict[str, InMemoryChatMessageHistory] = {}
+
+
+def _citation_debug(message: str, *args) -> None:
+    if config.DEBUG_CITATIONS:
+        log.info("DEBUG_CITATIONS " + message, *args)
+
+
+def _log_segment_distribution(lecture_id: str, segments: list[dict]) -> None:
+    durations = [
+        float(segment["end"]) - float(segment["start"])
+        for segment in segments
+        if segment.get("start") is not None
+        and segment.get("end") is not None
+        and float(segment["end"]) >= float(segment["start"])
+    ]
+    distribution = (
+        {
+            "min": min(durations),
+            "median": statistics.median(durations),
+            "max": max(durations),
+        }
+        if durations
+        else {"min": None, "median": None, "max": None}
+    )
+    _citation_debug(
+        "lecture=%s segment_duration_count=%d distribution_seconds=%s "
+        "CHUNK_MINUTES=%s RAG_CHUNK_SIZE=%s RAG_CHUNK_OVERLAP=%s",
+        lecture_id,
+        len(durations),
+        distribution,
+        config.CHUNK_MINUTES,
+        config.RAG_CHUNK_SIZE,
+        config.RAG_CHUNK_OVERLAP,
+    )
 
 
 def _session_key(user_id: str, lecture_id: str, session_id: str) -> str:
@@ -93,44 +135,50 @@ def _documents(transcript: str, segments: list[dict]) -> list[Document]:
         )
         return [Document(page_content=text, metadata={}) for text in splitter.split_text(transcript)]
 
-    documents, text_parts, chunk_segments = [], [], []
-    start_time = segments[0]["start"]
-    end_time = start_time
+    documents: list[Document] = []
+    chunk_segments: list[dict] = []
     char_count = 0
+
+    def append_chunk() -> None:
+        if not chunk_segments:
+            return
+        copied_segments = [dict(segment) for segment in chunk_segments]
+        documents.append(
+            Document(
+                page_content=" ".join(segment["text"] for segment in copied_segments),
+                metadata={
+                    "start_seconds": copied_segments[0]["start"],
+                    "end_seconds": copied_segments[-1]["end"],
+                    "segments": copied_segments,
+                },
+            )
+        )
+
     for segment in segments:
         text = segment["text"].strip()
         if not text:
             continue
-        if text_parts and char_count + len(text) > config.RAG_CHUNK_SIZE:
-            documents.append(
-                Document(
-                    page_content=" ".join(text_parts),
-                    metadata={
-                        "start_seconds": start_time,
-                        "end_seconds": end_time,
-                        "segments": chunk_segments,
-                    },
-                )
+        if chunk_segments and char_count + len(text) + 1 > config.RAG_CHUNK_SIZE:
+            append_chunk()
+            overlap: list[dict] = []
+            overlap_chars = 0
+            for previous in reversed(chunk_segments):
+                contribution = len(previous["text"]) + (1 if overlap else 0)
+                if overlap and overlap_chars + contribution > config.RAG_CHUNK_OVERLAP:
+                    break
+                if not overlap and len(previous["text"]) > config.RAG_CHUNK_OVERLAP:
+                    break
+                overlap.insert(0, previous)
+                overlap_chars += contribution
+            chunk_segments = overlap
+            char_count = sum(len(item["text"]) for item in chunk_segments) + max(
+                0, len(chunk_segments) - 1
             )
-            text_parts, chunk_segments, char_count = [], [], 0
-            start_time = segment["start"]
-        text_parts.append(text)
-        char_count += len(text)
-        end_time = segment["end"]
         chunk_segments.append(
             {"start": segment["start"], "end": segment["end"], "text": text}
         )
-    if text_parts:
-        documents.append(
-            Document(
-                page_content=" ".join(text_parts),
-                metadata={
-                    "start_seconds": start_time,
-                    "end_seconds": end_time,
-                    "segments": chunk_segments,
-                },
-            )
-        )
+        char_count += len(text) + (1 if len(chunk_segments) > 1 else 0)
+    append_chunk()
     return documents
 
 
@@ -138,6 +186,7 @@ def index_lecture(
     lecture_id: str, transcript: str, user_id: str, segments: list[dict] | None = None
 ) -> int:
     """Embed a lecture into the owner's Supabase pgvector rows."""
+    _log_segment_distribution(lecture_id, segments or [])
     docs = _documents(transcript, segments or [])
     client = store.client()
     client.table("lecture_chunks").delete().eq("lecture_id", lecture_id).eq("user_id", user_id).execute()
@@ -153,7 +202,7 @@ def index_lecture(
         )
         embeddings = with_retry(
             lambda batch=batch: get_embeddings().embed_documents(
-                [doc.page_content for doc in batch]
+                [doc.page_content for doc in batch], output_dimensionality=768
             ),
             tries=6,
             base_delay=2.0,
@@ -187,7 +236,7 @@ def delete_lecture_vectors(lecture_id: str, user_id: str) -> None:
 def _retrieve(
     question: str, lecture_id: str, user_id: str, match_count: int | None = None
 ) -> list[Document]:
-    embedding = get_embeddings().embed_query(question)
+    embedding = get_embeddings().embed_query(question, output_dimensionality=768)
     rows = (
         store.client()
         .rpc(
@@ -227,104 +276,152 @@ def _tokens(text: str) -> set[str]:
     }
 
 
-def _best_segment(doc: Document, question: str) -> dict:
-    segments = doc.metadata.get("segments") or [
-        {
-            "start": doc.metadata.get("start_seconds"),
-            "end": doc.metadata.get("end_seconds"),
-            "text": doc.page_content,
-        }
-    ]
-    question_tokens = _tokens(question)
-    ranked = []
+def _first_matching_segment(doc: Document, question: str) -> dict | None:
+    terms = _tokens(question)
+    segments = doc.metadata.get("segments")
+    if not isinstance(segments, list):
+        return None
+    for segment in segments:
+        text = str(segment.get("text") or "").strip()
+        if terms & _tokens(text):
+            return segment
+    return None
+
+
+def _citation_runs(doc: Document, question: str, duration: float | None) -> list[dict]:
+    segments = doc.metadata.get("segments")
+    if not isinstance(segments, list) or not segments:
+        log.warning(
+            "Skipping citation for chunk %s: segment metadata is missing",
+            doc.metadata.get("chunk"),
+        )
+        return []
+    if duration is None or duration <= 0:
+        log.warning(
+            "Skipping citation for chunk %s: lecture duration is unavailable",
+            doc.metadata.get("chunk"),
+        )
+        return []
+
+    terms = _tokens(question)
+    runs: list[list[dict]] = []
+    current: list[dict] = []
+    previous_index: int | None = None
     for index, segment in enumerate(segments):
         text = str(segment.get("text") or "").strip()
-        if not text:
+        start, end = segment.get("start"), segment.get("end")
+        segment_terms = terms & _tokens(text)
+        if not segment_terms or start is None or end is None:
+            if current:
+                runs.append(current)
+                current = []
+            previous_index = None
             continue
-        overlap = len(question_tokens & _tokens(text))
-        score = overlap / max(1, len(question_tokens))
-        ranked.append((score, -index, segment))
-    if not ranked:
-        return {
-            "start": doc.metadata.get("start_seconds"),
-            "end": doc.metadata.get("end_seconds"),
-            "text": doc.page_content,
-            "segment_score": 0.0,
-            "similarity": doc.metadata.get("similarity", 0.0),
+        start, end = float(start), float(end)
+        if start < 0 or end <= start or start >= duration:
+            if current:
+                runs.append(current)
+                current = []
+            previous_index = None
+            continue
+        segment = {
+            "start": start,
+            "end": min(end, duration),
+            "text": text,
         }
-    score, _, segment = max(ranked, key=lambda item: (item[0], item[1]))
-    return {
-        "start": segment.get("start"),
-        "end": segment.get("end"),
-        "text": segment["text"].strip(),
-        "segment_score": score,
-        "similarity": float(doc.metadata.get("similarity") or 0),
-    }
+        if current and previous_index == index - 1:
+            current.append(segment)
+        else:
+            if current:
+                runs.append(current)
+            current = [segment]
+        previous_index = index
+    if current:
+        runs.append(current)
+
+    hits = []
+    for run in runs:
+        start = run[0]["start"]
+        end = run[-1]["end"]
+        if not start < end <= duration:
+            continue
+        _citation_debug(
+            "chunk=%s chosen_segment_run=(%s,%s,%r)",
+            doc.metadata.get("chunk"),
+            start,
+            end,
+            " ".join(segment["text"] for segment in run)[:300],
+        )
+        hits.append(
+            {
+                "start": start,
+                "end": end,
+                "is_range": len(run) > 1,
+                "text": " ".join(segment["text"] for segment in run),
+            }
+        )
+    return hits
 
 
-def _source(start: float, end: float, text: str) -> dict:
-    start = max(0.0, float(start))
-    end = max(start, float(end))
+def _source(start: float, end: float, text: str, is_range: bool) -> dict:
     label = format_timestamp(start)
-    if end > start:
+    if is_range and end > start:
         label = f"{label}-{format_timestamp(end)}"
     return {
         "start": start,
-        "end": end,
+        "end": end if is_range else start,
         "timestamp_label": label,
         "text_snippet": text[:300],
     }
 
 
-def _explain_sources(hits: list[dict]) -> list[dict]:
-    sources = []
-    seen = set()
-    for hit in sorted(hits, key=lambda item: item["similarity"], reverse=True):
-        if hit["start"] is None:
-            continue
-        key = (round(float(hit["start"]), 1), hit["text"].casefold())
-        if key in seen:
-            continue
-        seen.add(key)
-        sources.append(_source(hit["start"], hit["start"], hit["text"]))
-        if len(sources) == 3:
-            break
-    return sorted(sources, key=lambda source: source["start"])
-
-
-def _locate_sources(hits: list[dict]) -> list[dict]:
-    ordered = sorted(
-        (hit for hit in hits if hit["start"] is not None),
-        key=lambda hit: (float(hit["start"]), float(hit["end"] or hit["start"])),
-    )
+def _locate_sources(hits: list[dict], duration: float | None) -> list[dict]:
+    if duration is None or duration <= 0:
+        return []
+    unique_hits = {
+        (hit["start"], hit["end"], hit["text"].casefold()): hit for hit in hits
+    }
+    ordered = sorted(unique_hits.values(), key=lambda hit: (hit["start"], hit["end"]))
     merged = []
     for hit in ordered:
         start = float(hit["start"])
-        end = max(start, float(hit["end"] or start))
-        if merged and start <= merged[-1]["end"] + 20:
+        end = min(float(hit["end"]), duration)
+        if start < 0 or start >= duration or end <= start:
+            continue
+        if (
+            merged
+            and start - merged[-1]["end"] <= 20
+            and max(merged[-1]["end"], end) - merged[-1]["start"] <= 90
+        ):
             merged[-1]["end"] = max(merged[-1]["end"], end)
-            merged[-1]["count"] += 1
+            merged[-1]["is_range"] = True
             if hit["text"] not in merged[-1]["texts"]:
                 merged[-1]["texts"].append(hit["text"])
         else:
             merged.append(
-                {"start": start, "end": end, "count": 1, "texts": [hit["text"]]}
+                {
+                    "start": start,
+                    "end": end,
+                    "is_range": hit["is_range"],
+                    "texts": [hit["text"]],
+                }
             )
     sources = [
         _source(
             item["start"],
-            item["end"] if item["count"] > 1 else item["start"],
+            item["end"],
             " ".join(item["texts"]),
+            item["is_range"],
         )
         for item in merged
     ]
     return sources[:15]
 
 
-def _format_snippets(hits: list[dict]) -> str:
+def _format_snippets(docs: list[Document]) -> str:
     return "\n\n---\n\n".join(
-        f"Excerpt {index}: {hit['text'][:1200]}"
-        for index, hit in enumerate(hits[:6], start=1)
+        f"Snippet {index}: {doc.page_content[:config.RAG_CHUNK_SIZE]}"
+        for index, doc in enumerate(docs)
     ) or "(no excerpts found)"
 
 
@@ -341,7 +438,7 @@ def _rewrite_question(llm, question: str, history: list) -> str:
     ).strip()
 
 
-def _answer(llm, question: str, context: str, history: list) -> str:
+def _answer(llm, question: str, context: str, history: list) -> dict:
     answer = (
         ChatPromptTemplate.from_messages(
             [("system", ANSWER_SYSTEM), MessagesPlaceholder("history"), ("human", "{input}")]
@@ -349,13 +446,32 @@ def _answer(llm, question: str, context: str, history: list) -> str:
         | llm
         | StrOutputParser()
     )
-    return answer.invoke(
+    raw = answer.invoke(
         {
             "input": question,
             "context": context,
             "history": history[-config.HISTORY_WINDOW :],
         }
     ).strip()
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        log.warning("Chat answer returned malformed grounding JSON")
+        return {"answer": "I couldn't verify an answer from the lecture excerpts.", "grounded": False, "supporting_snippet_ids": []}
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("answer"), str)
+        or not isinstance(payload.get("grounded"), bool)
+        or not isinstance(payload.get("supporting_snippet_ids"), list)
+        or any(
+            not isinstance(snippet_id, int) or isinstance(snippet_id, bool)
+            for snippet_id in payload["supporting_snippet_ids"]
+        )
+    ):
+        log.warning("Chat answer returned invalid grounding JSON fields")
+        return {"answer": "I couldn't verify an answer from the lecture excerpts.", "grounded": False, "supporting_snippet_ids": []}
+    payload["supporting_snippet_ids"] = list(dict.fromkeys(payload["supporting_snippet_ids"]))
+    return payload
 
 
 def ask(
@@ -390,12 +506,53 @@ def ask(
         user_id,
         config.RAG_LOCATE_K if intent == "locate" else config.RAG_TOP_K,
     )
-    hits = [
-        _best_segment(doc, standalone)
-        for doc in candidates
-        if float(doc.metadata.get("similarity") or 0) >= config.RAG_MIN_SCORE
+    question_terms = _tokens(standalone)
+    scored_docs = []
+    lexical_matches = set()
+    for doc in candidates:
+        score = float(doc.metadata.get("similarity") or 0)
+        matched_terms = question_terms & _tokens(doc.page_content)
+        chosen = _first_matching_segment(doc, standalone)
+        _citation_debug(
+            "chunk=%s score=%.5f chunk_start=%s chunk_end=%s has_segments=%s "
+            "lexical_terms=%s chosen_segment=(%s,%s,%r)",
+            doc.metadata.get("chunk"),
+            score,
+            doc.metadata.get("start_seconds"),
+            doc.metadata.get("end_seconds"),
+            bool(doc.metadata.get("segments")),
+            sorted(matched_terms),
+            chosen.get("start") if chosen else None,
+            chosen.get("end") if chosen else None,
+            str(chosen.get("text") or "")[:300] if chosen else "",
+        )
+        if score >= config.RAG_MIN_SCORE:
+            scored_docs.append((doc, matched_terms, score))
+            lexical_matches.update(matched_terms)
+
+    _citation_debug(
+        "question=%r standalone=%r intent=%s RAG_MIN_SCORE=%s "
+        "RAG_LEXICAL_MIN_MATCHES=%s lexical_matches=%s "
+        "RAG_TOP_K=%s RAG_LOCATE_K=%s RAG_CHUNK_SIZE=%s RAG_CHUNK_OVERLAP=%s",
+        question,
+        standalone,
+        intent,
+        config.RAG_MIN_SCORE,
+        config.RAG_LEXICAL_MIN_MATCHES,
+        sorted(lexical_matches),
+        config.RAG_TOP_K,
+        config.RAG_LOCATE_K,
+        config.RAG_CHUNK_SIZE,
+        config.RAG_CHUNK_OVERLAP,
+    )
+    grounded_docs = [
+        doc for doc, terms, _ in scored_docs if terms
     ]
-    if not hits:
+    if (
+        not scored_docs
+        or len(lexical_matches) < config.RAG_LEXICAL_MIN_MATCHES
+        or not grounded_docs
+    ):
         answer = "This lecture doesn't appear to cover that topic. Ask if you'd like a short general explanation."
         if GENERAL_REQUEST_PATTERN.search(question):
             llm = llm or get_llm(temperature=0.3)
@@ -418,18 +575,85 @@ def ask(
         }
     else:
         llm = llm or get_llm(temperature=0.3)
-        answer = with_retry(
-            lambda: _answer(llm, question, _format_snippets(hits), chat_history),
+        prompt_docs = grounded_docs[: (10 if intent == "explain" else 6)]
+        parsed = with_retry(
+            lambda: _answer(llm, standalone, _format_snippets(prompt_docs), chat_history),
             tries=1,
         )
-        sources = _locate_sources(hits) if intent == "locate" else _explain_sources(hits)
+        valid_support_ids = [
+            snippet_id
+            for snippet_id in parsed["supporting_snippet_ids"]
+            if 0 <= snippet_id < len(prompt_docs)
+        ]
+        grounded = parsed["grounded"] and bool(valid_support_ids)
+        answer = parsed["answer"]
+        if not grounded:
+            answer = (
+                "This lecture doesn't appear to cover that topic. "
+                "Ask if you'd like a short general explanation."
+            )
+            if GENERAL_REQUEST_PATTERN.search(question):
+                general = (
+                    ChatPromptTemplate.from_messages(
+                        [("system", GENERAL_SYSTEM), ("human", "{input}")]
+                    )
+                    | llm
+                    | StrOutputParser()
+                )
+                general_answer = with_retry(
+                    lambda: general.invoke({"input": question}), tries=1
+                ).strip()
+                answer = f"{answer}\n\nOutside the lecture: {general_answer}"
+
+        lecture_segments = store.load_transcript_segments(lecture_id, user_id)
+        duration = max(
+            (
+                float(segment["end"])
+                for segment in lecture_segments
+                if segment.get("end") is not None
+            ),
+            default=None,
+        )
+        citation_hits = []
+        if grounded:
+            for snippet_id in valid_support_ids:
+                doc = prompt_docs[snippet_id]
+                for hit in _citation_runs(doc, standalone, duration):
+                    hit["similarity"] = float(doc.metadata.get("similarity") or 0)
+                    citation_hits.append(hit)
+        if intent == "locate":
+            sources = _locate_sources(citation_hits, duration) if grounded else []
+        else:
+            selected_hits = sorted(
+                citation_hits, key=lambda hit: hit["similarity"], reverse=True
+            )
+            sources = []
+            seen = set()
+            for hit in selected_hits:
+                source_key = (
+                    round(hit["start"], 3),
+                    round(hit["end"], 3),
+                    hit["text"].casefold(),
+                )
+                if source_key in seen:
+                    continue
+                seen.add(source_key)
+                sources.append(
+                    _source(hit["start"], hit["end"], hit["text"], hit["is_range"])
+                )
+                if len(sources) == 3:
+                    break
+            sources.sort(key=lambda source: source["start"])
+        if not grounded:
+            sources = []
         result = {
             "answer": answer,
             "sources": sources,
-            "intent": intent,
-            "grounded": True,
+            "intent": intent if grounded else "off_topic",
+            "grounded": grounded,
         }
 
+    _citation_debug("final_sources=%s grounded=%s", result["sources"], result["grounded"])
     _get_history(key).add_user_message(question)
     _get_history(key).add_ai_message(result["answer"])
     return result

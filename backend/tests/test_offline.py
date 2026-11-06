@@ -49,9 +49,9 @@ def test_chat_memory_and_followup_rewrite(monkeypatch):
     from app import rag
 
     llm = GenericFakeChatModel(messages=iter([
-        AIMessage(content="Deadlock is when processes wait on each other forever."),       # answer 1
+        AIMessage(content='{"answer":"Deadlock requires processes waiting on each other.","grounded":true,"supporting_snippet_ids":[0]}'),  # answer 1
         AIMessage(content="Give an example of deadlock"),                                  # rewrite of follow-up
-        AIMessage(content="Two processes each hold one lock and wait for the other."),    # answer 2
+        AIMessage(content='{"answer":"Two processes can wait on each other.","grounded":true,"supporting_snippet_ids":[0]}'),  # answer 2
     ]))
     seen = []
 
@@ -68,8 +68,21 @@ def test_chat_memory_and_followup_rewrite(monkeypatch):
 
     monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
     monkeypatch.setattr(rag, "_retrieve", retrieve)
+    monkeypatch.setattr(
+        rag.store,
+        "load_transcript_segments",
+        lambda *_: [{"start": 0, "end": 1000, "text": "lecture"}],
+    )
     r1 = rag.ask("lec1", "s1", "What is deadlock?")
-    r2 = rag.ask("lec1", "s1", "Can you give an example?")
+    r2 = rag.ask(
+        "lec1",
+        "s1",
+        "Can you give an example?",
+        history=[
+            {"role": "user", "content": "What is deadlock?"},
+            {"role": "assistant", "content": r1["answer"]},
+        ],
+    )
     assert "wait" in r1["answer"] and r1["sources"][0]["start"] == 60
     assert seen[0][0] == "What is deadlock?"          # first question: no rewrite
     assert seen[1][0] == "Give an example of deadlock"  # follow-up: rewritten with history
@@ -97,6 +110,30 @@ def test_title_and_audio_timestamp_helpers():
     ]
 
 
+def test_chunk_overlap_preserves_complete_segment_boundaries(monkeypatch):
+    from app import rag
+
+    monkeypatch.setattr(rag.config, "RAG_CHUNK_SIZE", 18)
+    monkeypatch.setattr(rag.config, "RAG_CHUNK_OVERLAP", 8)
+    segments = [
+        {"start": 0, "end": 2, "text": "one two"},
+        {"start": 2, "end": 4, "text": "three 4"},
+        {"start": 4, "end": 6, "text": "five six"},
+    ]
+
+    docs = rag._documents("one two three 4 five six", segments)
+
+    assert len(docs) == 2
+    assert [segment["text"] for segment in docs[0].metadata["segments"]] == [
+        "one two",
+        "three 4",
+    ]
+    assert [segment["text"] for segment in docs[1].metadata["segments"]] == [
+        "three 4",
+        "five six",
+    ]
+
+
 def _citation_doc(start, end, text, similarity=0.8, chunk_start=None):
     return Document(
         page_content=text,
@@ -110,8 +147,15 @@ def _citation_doc(start, end, text, similarity=0.8, chunk_start=None):
 
 
 def _fake_answer_llm(monkeypatch, app_rag):
-    llm = GenericFakeChatModel(messages=iter([AIMessage(content="Grounded answer.")]))
+    llm = GenericFakeChatModel(messages=iter([
+        AIMessage(content='{"answer":"Grounded answer.","grounded":true,"supporting_snippet_ids":[0,1,2,3,4,5,6,7,8,9]}')
+    ]))
     monkeypatch.setattr(app_rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        app_rag.store,
+        "load_transcript_segments",
+        lambda *_: [{"start": 0, "end": 1000, "text": "lecture"}],
+    )
 
 
 def test_off_topic_has_no_sources_and_is_not_grounded(monkeypatch):
@@ -122,6 +166,25 @@ def test_off_topic_has_no_sources_and_is_not_grounded(monkeypatch):
         rag, "get_llm", lambda **_: (_ for _ in ()).throw(AssertionError("LLM should not answer"))
     )
     result = rag.ask("lec-off-topic", "s1", "What is quantum computing?")
+
+    assert result["sources"] == []
+    assert result["grounded"] is False
+    assert result["intent"] == "off_topic"
+
+
+def test_lexical_gate_rejects_high_similarity_unrelated_chunks(monkeypatch):
+    from app import rag
+
+    monkeypatch.setattr(
+        rag,
+        "_retrieve",
+        lambda *args: [_citation_doc(0, 5, "The lecture explains disk allocation.", 0.9)],
+    )
+    monkeypatch.setattr(
+        rag, "get_llm", lambda **_: (_ for _ in ()).throw(AssertionError("LLM should not answer"))
+    )
+
+    result = rag.ask("lec-lexical-filter", "s1", "What does accumulate do in the C++ STL?")
 
     assert result["sources"] == []
     assert result["grounded"] is False
@@ -147,6 +210,19 @@ def test_locate_merges_nearby_hits_and_sorts_ranges(monkeypatch):
     assert [source["start"] for source in result["sources"]] == [30, 100]
     assert result["sources"][1]["end"] == 118
     assert result["sources"][1]["timestamp_label"] == "01:40-01:58"
+
+
+def test_locate_chain_of_hits_does_not_exceed_90_seconds():
+    from app.rag import _locate_sources
+
+    hits = [
+        {"start": float(start), "end": float(start + 5), "is_range": True, "text": str(start)}
+        for start in range(0, 721, 15)
+    ]
+    sources = _locate_sources(hits, duration=1000)
+
+    assert len(sources) > 1
+    assert all(0 < source["end"] - source["start"] <= 90 for source in sources)
 
 
 def test_explain_returns_at_most_three_sources(monkeypatch):
@@ -176,13 +252,138 @@ def test_citation_time_uses_segment_metadata_not_chunk_start(monkeypatch):
     assert result["sources"][0]["timestamp_label"] == "02:03"
 
 
+def test_chunk_without_segment_metadata_is_not_a_citation(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(messages=iter([
+        AIMessage(content='{"answer":"Chaining is discussed.","grounded":true,"supporting_snippet_ids":[0]}')
+    ]))
+    doc = Document(
+        page_content="Chaining is used to link allocated file blocks.",
+        metadata={"similarity": 0.8, "start_seconds": 0, "end_seconds": 732},
+    )
+    monkeypatch.setattr(rag, "_retrieve", lambda *args: [doc])
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag.store,
+        "load_transcript_segments",
+        lambda *_: [{"start": 0, "end": 800, "text": "transcript"}],
+    )
+
+    result = rag.ask(
+        "lec-missing-segments", "s1", "Where does the speaker discuss chaining?"
+    )
+
+    assert result["sources"] == []
+
+
+def test_ungrounded_llm_output_returns_no_sources(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(messages=iter([
+        AIMessage(content='{"answer":"The lecture does not cover this.","grounded":false,"supporting_snippet_ids":[0]}')
+    ]))
+    monkeypatch.setattr(rag, "_retrieve", lambda *args: [
+        _citation_doc(123, 130, "Mitochondria make cellular energy.")
+    ])
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag.store,
+        "load_transcript_segments",
+        lambda *_: [{"start": 0, "end": 1000, "text": "lecture"}],
+    )
+
+    result = rag.ask("lec-ungrounded", "s1", "Explain mitochondria")
+
+    assert result["grounded"] is False
+    assert result["sources"] == []
+
+
+def test_grounded_llm_without_supporting_ids_is_ungrounded(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(messages=iter([
+        AIMessage(content='{"answer":"Possibly covered.","grounded":true,"supporting_snippet_ids":[]}')
+    ]))
+    monkeypatch.setattr(rag, "_retrieve", lambda *args: [
+        _citation_doc(123, 130, "Mitochondria make cellular energy.")
+    ])
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag.store,
+        "load_transcript_segments",
+        lambda *_: [{"start": 0, "end": 1000, "text": "lecture"}],
+    )
+
+    result = rag.ask("lec-no-support", "s1", "Explain mitochondria")
+
+    assert result["grounded"] is False
+    assert result["sources"] == []
+
+
+def test_malformed_llm_json_returns_ungrounded(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(messages=iter([AIMessage(content="not JSON")]))
+    monkeypatch.setattr(rag, "_retrieve", lambda *args: [
+        _citation_doc(123, 130, "Mitochondria make cellular energy.")
+    ])
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag.store,
+        "load_transcript_segments",
+        lambda *_: [{"start": 0, "end": 1000, "text": "lecture"}],
+    )
+
+    result = rag.ask("lec-invalid-json", "s1", "Explain mitochondria")
+
+    assert result["grounded"] is False
+    assert result["sources"] == []
+
+
+def test_locate_cites_first_segment_of_relevant_run(monkeypatch):
+    from app import rag
+
+    llm = GenericFakeChatModel(messages=iter([
+        AIMessage(content='{"answer":"Chaining links blocks.","grounded":true,"supporting_snippet_ids":[0]}')
+    ]))
+    doc = Document(
+        page_content="Chaining links allocated file blocks.",
+        metadata={
+            "similarity": 0.8,
+            "start_seconds": 0,
+            "end_seconds": 200,
+            "segments": [
+                {"start": 100, "end": 104, "text": "Files have a beginning."},
+                {"start": 123, "end": 127, "text": "Chaining links allocated blocks."},
+                {"start": 127, "end": 131, "text": "Chaining continues through another block."},
+            ],
+        },
+    )
+    monkeypatch.setattr(rag, "_retrieve", lambda *args: [doc])
+    monkeypatch.setattr(rag, "get_llm", lambda **_: llm)
+    monkeypatch.setattr(
+        rag.store,
+        "load_transcript_segments",
+        lambda *_: [{"start": 0, "end": 500, "text": "lecture"}],
+    )
+
+    result = rag.ask(
+        "lec-first-run", "s1", "Where does the speaker discuss chaining?"
+    )
+
+    assert result["sources"][0]["start"] == 123
+    assert result["sources"][0]["end"] == 131
+
+
 def test_embedding_retries_transient_provider_failures(monkeypatch):
     from app import rag, utils
 
     calls = []
 
     class FakeEmbeddings:
-        def embed_documents(self, texts):
+        def embed_documents(self, texts, output_dimensionality=None):
+            assert output_dimensionality == 768
             calls.append(texts)
             if len(calls) == 1:
                 raise RuntimeError("503 UNAVAILABLE")

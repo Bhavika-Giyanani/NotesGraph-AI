@@ -892,7 +892,7 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
               </span><ArrowRight className="card-arrow" size={17} /></motion.button>)}
           </div> : <div className="empty-library"><div className="empty-art"><BookOpen size={27} /><Sparkles size={16} /></div><h3>{query ? "No lectures found" : "Your first lecture starts here"}</h3><p>{query ? "Try another search." : "Add a recording or paste a transcript to create your first set of notes."}</p>{!query && <button className="button button-dark" onClick={() => { setResumeUpload(null); setShowUpload(true); }}><Plus size={17} /> Add your first lecture</button>}</div>}
           <div className="library-footnote"><span><Check size={14} /> Private to your account</span><span>{lectures.length} {lectures.length === 1 ? "lecture" : "lectures"} saved</span></div>
-        </section> : <LectureView lecture={selected} view={view} setView={setView} onBack={() => navigate("/app")} onDelete={() => deleteLecture(selected.id)} onRetry={() => retryLecture(selected.id)} onRetryIndex={() => retryIndex(selected.id)} onResumeUpload={() => resumeAudioUpload(selected)} uploadingAudio={uploadProgress[selected.id] !== undefined} onDownload={download}
+        </section> : <LectureView lecture={selected} userInitial={userName.slice(0, 1).toUpperCase()} view={view} setView={setView} onBack={() => navigate("/app")} onDelete={() => deleteLecture(selected.id)} onRetry={() => retryLecture(selected.id)} onRetryIndex={() => retryIndex(selected.id)} onResumeUpload={() => resumeAudioUpload(selected)} uploadingAudio={uploadProgress[selected.id] !== undefined} onDownload={download}
           sessions={sessions} chatSession={chatSession} messages={messages} onCreateChat={createChat} onChooseChat={chooseChat} setMessages={setMessages} transcript={transcript} onTranscript={showTranscript} />}
       </div>
     </main>
@@ -907,8 +907,8 @@ function Dashboard({ session, theme }: { session: Session; theme: ReturnType<typ
   </div>;
 }
 
-function LectureView({ lecture, view, setView, onBack, onDelete, onRetry, onRetryIndex, onResumeUpload, uploadingAudio, onDownload, sessions, chatSession: active, messages, onCreateChat: onCreate, onChooseChat: onChoose, setMessages, transcript, onTranscript }: {
-  lecture: Lecture; view: "notes" | "chat" | "transcript"; setView: (view: "notes" | "chat" | "transcript") => void;
+function LectureView({ lecture, userInitial, view, setView, onBack, onDelete, onRetry, onRetryIndex, onResumeUpload, uploadingAudio, onDownload, sessions, chatSession: active, messages, onCreateChat: onCreate, onChooseChat: onChoose, setMessages, transcript, onTranscript }: {
+  lecture: Lecture; userInitial: string; view: "notes" | "chat" | "transcript"; setView: (view: "notes" | "chat" | "transcript") => void;
   onBack: () => void; onRetry: () => void; onRetryIndex: () => void;
   onResumeUpload: () => void; uploadingAudio: boolean;
   onDelete: () => void; onDownload: (path: string, filename: string) => void; sessions: ChatSession[];
@@ -974,7 +974,7 @@ function LectureView({ lecture, view, setView, onBack, onDelete, onRetry, onRetr
         {audioError && <p className="audio-error">{audioError}</p>}
         <div className="detail-tabs"><button className={view === "notes" ? "active" : ""} onClick={() => setView("notes")}><FileText size={16} /> Study notes</button><button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")}><MessageCircle size={16} /> Ask this lecture</button><button className={view === "transcript" ? "active" : ""} onClick={onTranscript}><AudioLines size={16} /> Transcript</button></div>
         {view === "notes" && <NotesView notes={lecture.notes} />}
-        {view === "chat" && <ChatView lectureId={lecture.id} sessions={sessions} active={active} messages={messages} onCreate={onCreate} onChoose={onChoose} setMessages={setMessages} onSeek={onSeek} />}
+        {view === "chat" && <ChatView lectureId={lecture.id} userInitial={userInitial} sessions={sessions} active={active} messages={messages} onCreate={onCreate} onChoose={onChoose} setMessages={setMessages} onSeek={onSeek} />}
         {view === "transcript" && <div className="transcript-panel"><div className="panel-title"><div><span className="eyebrow">FROM THE RECORDING</span><h2>Lecture transcript</h2></div><span className="transcript-readonly"><Check size={14} /> Source transcript</span></div><pre>{transcript || "Loading transcript…"}</pre></div>}
       </div>
       <aside className="detail-aside"><div className="aside-card"><span className="aside-icon"><Sparkles size={17} /></span><span className="eyebrow">QUICK OVERVIEW</span><p>{lecture.notes?.summary || "Your lecture summary will appear here."}</p><div className="aside-stats"><span><b>{lecture.notes?.core_explanations?.length || 0}</b> topics</span><span><b>{lecture.notes?.exam_points?.length || 0}</b> exam tips</span></div></div>
@@ -999,8 +999,8 @@ function NoteSection({ title, tone, icon, children }: { title: string; tone: str
   return <section className={`note-section ${tone}`}><div className="note-section-title"><span>{icon}</span><h2>{title}</h2></div>{children}</section>;
 }
 
-function ChatView({ lectureId, sessions, active, messages, onCreate, onChoose, setMessages, onSeek }: {
-  lectureId: string; sessions: ChatSession[]; active: ChatSession | null; messages: ChatMessage[];
+function ChatView({ lectureId, userInitial, sessions, active, messages, onCreate, onChoose, setMessages, onSeek }: {
+  lectureId: string; userInitial: string; sessions: ChatSession[]; active: ChatSession | null; messages: ChatMessage[];
   onCreate: () => void; onChoose: (session: ChatSession, loadMessages?: boolean) => void;
   setMessages: Dispatch<SetStateAction<ChatMessage[]>>;
   onSeek: (startSeconds: number) => void;
@@ -1059,6 +1059,7 @@ function ChatView({ lectureId, sessions, active, messages, onCreate, onChoose, s
     };
     setSending(true);
     setError("");
+    setQuestion("");
     setMessages(current => [...current, optimistic, optimisticReply]);
     try {
       if (!chat) {
@@ -1073,9 +1074,9 @@ function ChatView({ lectureId, sessions, active, messages, onCreate, onChoose, s
         turn.user_message,
         turn.assistant_message,
       ]);
-      setQuestion("");
       onChoose({ ...chat, title: text.slice(0, 80) }, false);
     } catch (reason) {
+      setQuestion(current => current || text);
       setMessages(current => current.map(message => message.id === optimisticReply.id
         ? { ...message, status: "error", content: "The question could not be sent. Please try again." }
         : message));
@@ -1092,7 +1093,7 @@ function ChatView({ lectureId, sessions, active, messages, onCreate, onChoose, s
       {!messages.length && <div className="chat-welcome"><span><Sparkles size={20} /></span><h3>Your lecture, on demand.</h3><p>Ask a question and I’ll point you to the relevant moment in the recording.</p><div className="prompt-suggestions">{["What should I focus on for the exam?", "Explain the main idea simply", "Where does the lecture discuss its key example?"].map(text => <button key={text} onClick={() => setQuestion(text)}>{text} <ArrowRight size={14} /></button>)}</div></div>}
       {messages.map(message => {
         const sources = displaySources(message);
-        return <div key={message.id} className={`chat-message ${message.role}`}><span className="message-avatar">{message.role === "assistant" ? <Sparkles size={15} /> : "Y"}</span><div className={`message-content ${message.status === "error" ? "message-failed" : ""}`}>{message.status === "pending" ? <div className="thinking"><span /><span /><span /></div> : message.role === "assistant" ? <ReactMarkdown>{message.content}</ReactMarkdown> : <p>{message.content}</p>}{message.role === "assistant" && message.intent === "off_topic" && message.grounded === false && <p className="not-covered-note">Not covered in this lecture</p>}{sources.length > 0 && <div className="source-list"><span>{message.intent === "locate" ? `MENTIONED AT · ${sources.length} passages` : "RELATED MOMENTS"}</span>{sources.map(source => {
+        return <div key={message.id} className={`chat-message ${message.role}`}><span className="message-avatar">{message.role === "assistant" ? <Sparkles size={15} /> : userInitial}</span><div className={`message-content ${message.status === "error" ? "message-failed" : ""}`}>{message.status === "pending" ? <div className="thinking"><span /><span /><span /></div> : message.role === "assistant" ? <ReactMarkdown>{message.content}</ReactMarkdown> : <p>{message.content}</p>}{message.role === "assistant" && message.intent === "off_topic" && message.grounded === false && <p className="not-covered-note">Not covered in this lecture</p>}{sources.length > 0 && <div className="source-list"><span>{message.intent === "locate" ? `MENTIONED AT · ${sources.length} passages` : "RELATED MOMENTS"}</span>{sources.map(source => {
           const label = sourceLabel(source);
           return <button type="button" className="source-chip" key={`${source.start}-${source.end ?? source.start}`} title={source.text_snippet || ""} aria-label={`Jump to ${label}`} onClick={() => onSeek(source.start ?? 0)}><Clock3 size={13} /> {label}</button>;
         })}</div>}</div></div>;
