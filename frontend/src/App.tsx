@@ -3,6 +3,7 @@ import {
   type FormEvent,
   type ReactNode,
   type SetStateAction,
+  isValidElement,
   useCallback,
   useEffect,
   useMemo,
@@ -17,6 +18,7 @@ import {
   Check,
   ChevronDown,
   Clock3,
+  Copy,
   Eye,
   EyeOff,
   FileAudio2,
@@ -30,6 +32,7 @@ import {
   MessageCircle,
   Moon,
   Plus,
+  RotateCcw,
   Search,
   Send,
   Sparkles,
@@ -38,8 +41,9 @@ import {
   UploadCloud,
   X,
 } from "lucide-react";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, MotionConfig, motion } from "motion/react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   Link,
   Navigate,
@@ -94,6 +98,7 @@ type ChatSource = {
   timestamp_label?: string;
   text_snippet?: string;
 };
+type TranscriptSegment = { start: number; end: number; text: string };
 type ChatMessage = {
   id: number;
   role: "user" | "assistant";
@@ -101,8 +106,9 @@ type ChatMessage = {
   created_at: string;
   status?: "pending" | "complete" | "error";
   sources?: ChatSource[];
-  intent?: "locate" | "explain" | "off_topic";
+  intent?: "locate" | "explain" | "off_topic" | "conversation" | "general";
   grounded?: boolean;
+  pending_offer?: { type: "general_answer"; question: string } | null;
 };
 
 function formatSourceTime(seconds: number) {
@@ -126,7 +132,13 @@ function sourceLabel(source: ChatSource) {
 }
 
 function displaySources(message: ChatMessage) {
-  if (message.grounded === false || !message.sources?.length) return [];
+  if (
+    message.grounded === false ||
+    message.intent === "conversation" ||
+    message.intent === "general" ||
+    !message.sources?.length
+  )
+    return [];
   const unique = new Map(
     message.sources
       .filter((source) => typeof source.start === "number")
@@ -137,6 +149,41 @@ function displaySources(message: ChatMessage) {
   );
   return [...unique.values()].sort(
     (left, right) => (left.start ?? 0) - (right.start ?? 0),
+  );
+}
+
+function markdownText(value: ReactNode): string {
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  if (Array.isArray(value)) return value.map(markdownText).join("");
+  if (isValidElement<{ children?: ReactNode }>(value))
+    return markdownText(value.props.children);
+  return "";
+}
+
+function MarkdownCodeBlock({ children }: { children?: ReactNode }) {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "error">("idle");
+  async function copyCode() {
+    try {
+      await navigator.clipboard.writeText(markdownText(children));
+      setCopyState("copied");
+      window.setTimeout(() => setCopyState("idle"), 1400);
+    } catch {
+      setCopyState("error");
+    }
+  }
+  return (
+    <pre className="markdown-code">
+      <button
+        type="button"
+        className="code-copy"
+        onClick={() => void copyCode()}
+        aria-label="Copy code block"
+      >
+        <Copy size={13} />
+        {copyState === "copied" ? "Copied" : copyState === "error" ? "Copy failed" : "Copy"}
+      </button>
+      {children}
+    </pre>
   );
 }
 const configuredApiUrl = (
@@ -550,7 +597,8 @@ function App() {
   }, []);
 
   return (
-    <Routes>
+    <MotionConfig reducedMotion="user">
+      <Routes>
       <Route path="/" element={<Landing theme={theme} />} />
       <Route
         path="/sign-in"
@@ -569,7 +617,8 @@ function App() {
         }
       />
       <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
+      </Routes>
+    </MotionConfig>
   );
 }
 
@@ -1015,8 +1064,12 @@ function Dashboard({
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [chatSession, setChatSession] = useState<ChatSession | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [chatDraft, setChatDraft] = useState("");
   const chatLoadRequest = useRef(0);
-  const [view, setView] = useState<"notes" | "chat" | "transcript">("notes");
+  const [view, setViewState] = useState<"notes" | "chat" | "transcript">(() => {
+    const tab = new URLSearchParams(window.location.search).get("tab");
+    return tab === "chat" || tab === "transcript" ? tab : "notes";
+  });
   const [transcript, setTranscript] = useState("");
   const [folderFilter, setFolderFilter] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -1035,6 +1088,30 @@ function Dashboard({
   );
   const [detailLoading, setDetailLoading] = useState(false);
   const userName = session.user.email?.split("@")[0] || "Learner";
+
+  const replaceDetailQuery = useCallback(
+    (updates: { tab?: string; chat?: string | null }) => {
+      const url = new URL(window.location.href);
+      if (updates.tab !== undefined) url.searchParams.set("tab", updates.tab);
+      if (updates.chat !== undefined) {
+        if (updates.chat) url.searchParams.set("chat", updates.chat);
+        else url.searchParams.delete("chat");
+      }
+      window.history.replaceState(
+        window.history.state,
+        "",
+        `${url.pathname}${url.search}${url.hash}`,
+      );
+    },
+    [],
+  );
+  const setView = useCallback(
+    (next: "notes" | "chat" | "transcript") => {
+      setViewState(next);
+      replaceDetailQuery({ tab: next });
+    },
+    [replaceDetailQuery],
+  );
 
   const refresh = useCallback(async () => {
     const [lectureRows, folderRows] = await Promise.all([
@@ -1075,7 +1152,13 @@ function Dashboard({
     setSessions([]);
     setChatSession(null);
     setMessages([]);
-    setView("notes");
+    const params = new URLSearchParams(window.location.search);
+    const requestedTab = params.get("tab");
+    setViewState(
+      requestedTab === "chat" || requestedTab === "transcript"
+        ? requestedTab
+        : "notes",
+    );
     setError("");
     if (!routeLectureId) {
       setDetailLoading(false);
@@ -1093,6 +1176,19 @@ function Dashboard({
         if (cancelled) return;
         setSelected(data);
         setSessions(rows);
+        const chatId = new URLSearchParams(window.location.search).get("chat");
+        const restoredChat = rows.find((item) => item.id === chatId);
+        if (restoredChat) {
+          setChatSession(restoredChat);
+          const requestId = ++chatLoadRequest.current;
+          const messages = await api<ChatMessage[]>(
+            `/chat-sessions/${restoredChat.id}/messages`,
+          );
+          if (!cancelled && requestId === chatLoadRequest.current)
+            setMessages(messages);
+        } else if (chatId) {
+          replaceDetailQuery({ chat: null });
+        }
       } catch (reason) {
         if (!cancelled) setError(userFacingError(reason));
       } finally {
@@ -1103,7 +1199,7 @@ function Dashboard({
     return () => {
       cancelled = true;
     };
-  }, [routeLectureId]);
+  }, [routeLectureId, replaceDetailQuery]);
 
   const activeLectureIds = useMemo(
     () =>
@@ -1205,6 +1301,7 @@ function Dashboard({
   async function chooseChat(chat: ChatSession, loadMessages = true) {
     setChatSession(chat);
     setView("chat");
+    replaceDetailQuery({ tab: "chat", chat: chat.id });
     setError("");
     setSessions((current) =>
       current.some((item) => item.id === chat.id)
@@ -1239,6 +1336,7 @@ function Dashboard({
       setChatSession(chat);
       setMessages([]);
       setView("chat");
+      replaceDetailQuery({ tab: "chat", chat: chat.id });
     } catch (reason) {
       setError(userFacingError(reason));
     }
@@ -1253,6 +1351,38 @@ function Dashboard({
       await api(`/lectures/${id}`, { method: "DELETE" });
       navigate("/app");
       await refresh();
+    } catch (reason) {
+      setError(userFacingError(reason));
+    }
+  }
+
+  async function deleteSubject(folder: Folder) {
+    if (
+      !window.confirm(
+        `Delete the empty subject "${folder.name}"? Subjects with lectures cannot be deleted.`,
+      )
+    )
+      return;
+    try {
+      await api(`/folders/${folder.id}`, { method: "DELETE" });
+      if (folderFilter === folder.id) setFolderFilter(null);
+      await refresh();
+    } catch (reason) {
+      setError(userFacingError(reason));
+    }
+  }
+
+  async function deleteChat(chat: ChatSession) {
+    if (!window.confirm(`Delete the chat "${chat.title}" and its messages?`))
+      return;
+    try {
+      await api(`/chat-sessions/${chat.id}`, { method: "DELETE" });
+      setSessions((current) => current.filter((item) => item.id !== chat.id));
+      if (chatSession?.id === chat.id) {
+        setChatSession(null);
+        setMessages([]);
+        replaceDetailQuery({ chat: null });
+      }
     } catch (reason) {
       setError(userFacingError(reason));
     }
@@ -1452,6 +1582,7 @@ function Dashboard({
           <Brand />
           <button
             className="icon-btn mobile-close"
+            aria-label="Close navigation menu"
             onClick={() => setMobileMenu(false)}
           >
             <X size={18} />
@@ -1507,24 +1638,40 @@ function Dashboard({
               </button>
             </form>
           )}
-          {folders.map((folder) => (
-            <button
-              key={folder.id}
-              className={
-                folderFilter === folder.id ? "side-link selected" : "side-link"
-              }
-              onClick={() => {
-                setFolderFilter(folder.id);
-                navigate("/app");
-              }}
-            >
-              <FolderClosed size={16} />
-              {folder.name}
-              <span>
-                {lectures.filter((item) => item.folder_id === folder.id).length}
-              </span>
-            </button>
-          ))}
+          {folders.map((folder) => {
+            const count = lectures.filter(
+              (item) => item.folder_id === folder.id,
+            ).length;
+            return (
+              <div className="subject-row" key={folder.id}>
+                <button
+                  className={
+                    folderFilter === folder.id
+                      ? "side-link selected"
+                      : "side-link"
+                  }
+                  onClick={() => {
+                    setFolderFilter(folder.id);
+                    navigate("/app");
+                  }}
+                >
+                  <FolderClosed size={16} />
+                  {folder.name}
+                  <span>{count}</span>
+                </button>
+                {count === 0 && (
+                  <button
+                    className="icon-btn subject-delete"
+                    onClick={() => void deleteSubject(folder)}
+                    aria-label={`Delete empty subject ${folder.name}`}
+                    title="Delete empty subject"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                )}
+              </div>
+            );
+          })}
         </nav>
         <div className="sidebar-bottom">
           <div className="private-card">
@@ -1544,7 +1691,12 @@ function Dashboard({
               <b>{userName}</b>
               <small>Personal workspace</small>
             </div>
-            <button className="icon-btn" title="Sign out" onClick={signOut}>
+            <button
+              className="icon-btn"
+              title="Sign out"
+              aria-label="Sign out"
+              onClick={signOut}
+            >
               <LogOut size={17} />
             </button>
           </div>
@@ -1561,6 +1713,7 @@ function Dashboard({
         <header className="work-topbar">
           <button
             className="icon-btn mobile-menu"
+            aria-label="Open navigation menu"
             onClick={() => setMobileMenu(true)}
           >
             <Menu size={19} />
@@ -1748,8 +1901,11 @@ function Dashboard({
               sessions={sessions}
               chatSession={chatSession}
               messages={messages}
+              chatDraft={chatDraft}
+              setChatDraft={setChatDraft}
               onCreateChat={createChat}
               onChooseChat={chooseChat}
+              onDeleteChat={deleteChat}
               setMessages={setMessages}
               transcript={transcript}
               onTranscript={showTranscript}
@@ -1788,8 +1944,11 @@ function LectureView({
   sessions,
   chatSession: active,
   messages,
+  chatDraft,
+  setChatDraft,
   onCreateChat: onCreate,
   onChooseChat: onChoose,
+  onDeleteChat,
   setMessages,
   transcript,
   onTranscript,
@@ -1808,8 +1967,11 @@ function LectureView({
   sessions: ChatSession[];
   chatSession: ChatSession | null;
   messages: ChatMessage[];
+  chatDraft: string;
+  setChatDraft: Dispatch<SetStateAction<string>>;
   onCreateChat: () => void;
   onChooseChat: (session: ChatSession, loadMessages?: boolean) => void;
+  onDeleteChat: (session: ChatSession) => void;
   setMessages: Dispatch<SetStateAction<ChatMessage[]>>;
   transcript: string;
   onTranscript: () => void;
@@ -1817,44 +1979,84 @@ function LectureView({
   const audioRef = useRef<HTMLAudioElement>(null);
   const [audioUrl, setAudioUrl] = useState("");
   const [audioError, setAudioError] = useState("");
+  const [audioStatus, setAudioStatus] = useState("");
+  const [activeSourceKey, setActiveSourceKey] = useState("");
+  const [audioTime, setAudioTime] = useState(0);
+  const audioRetryCount = useRef(0);
+  const audioStatusTimeout = useRef<number | null>(null);
+  const timeUpdateFrame = useRef<number | null>(null);
 
+  const loadAudioUrl = useCallback(
+    async (retry = false) => {
+      if (!lecture.audio_path || !supabase) return;
+      if (retry && audioRetryCount.current >= 1) {
+        setAudioError("The lecture audio could not be loaded. Please try again later.");
+        return;
+      }
+      if (retry) audioRetryCount.current += 1;
+      try {
+        const { data, error } = await supabase.storage
+          .from("lecture-audio")
+          .createSignedUrl(lecture.audio_path, 3600);
+        if (error) throw error;
+        if (!data?.signedUrl) throw new Error("No signed audio URL was returned.");
+        setAudioUrl(data.signedUrl);
+        setAudioError("");
+      } catch (reason) {
+        setAudioError(userFacingError(reason));
+      }
+    },
+    [lecture.audio_path],
+  );
   useEffect(() => {
     if (!lecture.audio_path || !supabase) {
       setAudioUrl("");
       setAudioError("");
       return;
     }
-    let active = true;
+    audioRetryCount.current = 0;
     setAudioUrl("");
     setAudioError("");
-    supabase.storage
-      .from("lecture-audio")
-      .createSignedUrl(lecture.audio_path, 3600)
-      .then(({ data, error }) => {
-        if (error) throw error;
-        if (active) {
-          setAudioUrl(data.signedUrl);
-          setAudioError("");
-        }
-      })
-      .catch((reason) => {
-        if (active) setAudioError(userFacingError(reason));
-      });
-    return () => {
-      active = false;
-    };
-  }, [lecture.audio_path]);
+    void loadAudioUrl();
+  }, [lecture.audio_path, loadAudioUrl]);
 
-  const onSeek = useCallback((startSeconds: number) => {
+  const onSeek = useCallback((startSeconds: number, endSeconds?: number) => {
     const audio = audioRef.current;
-    if (!audio) {
+    if (!audio || !audioUrl) {
       setAudioError("The lecture audio is not ready to play yet.");
       return;
     }
     setAudioError("");
+    setActiveSourceKey(`${startSeconds}-${endSeconds ?? startSeconds}`);
+    setAudioStatus(`Playing from ${formatSourceTime(startSeconds)}`);
+    if (audioStatusTimeout.current !== null)
+      window.clearTimeout(audioStatusTimeout.current);
+    audioStatusTimeout.current = window.setTimeout(
+      () => setAudioStatus(""),
+      3000,
+    );
     audio.currentTime = Math.max(0, startSeconds - 1.5);
-    void audio.play().catch((reason) => setAudioError(userFacingError(reason)));
+    void audio.play().catch((reason) => {
+      setAudioStatus("");
+      setAudioError(userFacingError(reason));
+    });
+  }, [audioUrl]);
+  const onAudioTimeUpdate = useCallback(() => {
+    if (timeUpdateFrame.current !== null) return;
+    timeUpdateFrame.current = window.requestAnimationFrame(() => {
+      timeUpdateFrame.current = null;
+      if (audioRef.current) setAudioTime(audioRef.current.currentTime);
+    });
   }, []);
+  useEffect(
+    () => () => {
+      if (audioStatusTimeout.current !== null)
+        window.clearTimeout(audioStatusTimeout.current);
+      if (timeUpdateFrame.current !== null)
+        window.cancelAnimationFrame(timeUpdateFrame.current);
+    },
+    [],
+  );
 
   return (
     <motion.section
@@ -1929,6 +2131,7 @@ function LectureView({
             <button
               className="icon-btn danger-icon"
               title="Delete lecture"
+              aria-label="Delete lecture"
               onClick={onDelete}
             >
               <Trash2 size={17} />
@@ -1968,67 +2171,110 @@ function LectureView({
       {(lecture.status === "done" || lecture.status === "index_error") && (
         <div className="detail-layout">
           <div className="detail-primary">
-            {audioUrl && (
+            {lecture.audio_path && (
               <div className="lecture-audio">
-                <audio
-                  ref={audioRef}
-                  controls
-                  preload="metadata"
-                  src={audioUrl}
-                >
-                  Your browser does not support audio playback.
-                </audio>
+                {audioStatus && (
+                  <span className="audio-status" role="status">{audioStatus}</span>
+                )}
+                {audioUrl ? (
+                  <audio
+                    key={audioUrl}
+                    ref={audioRef}
+                    controls
+                    preload="metadata"
+                    src={audioUrl}
+                    onError={() => void loadAudioUrl(true)}
+                    onTimeUpdate={onAudioTimeUpdate}
+                  >
+                    Your browser does not support audio playback.
+                  </audio>
+                ) : (
+                  <div className="lecture-audio-skeleton" aria-label="Loading lecture audio">
+                    <span />
+                    <span />
+                  </div>
+                )}
               </div>
             )}
             {audioError && <p className="audio-error">{audioError}</p>}
-            <div className="detail-tabs">
+            <div
+              className="detail-tabs"
+              role="tablist"
+              aria-label="Lecture detail views"
+            >
               <button
+                id="detail-tab-notes"
+                role="tab"
+                aria-selected={view === "notes"}
+                aria-controls="detail-tabpanel"
                 className={view === "notes" ? "active" : ""}
                 onClick={() => setView("notes")}
               >
                 <FileText size={16} /> Study notes
               </button>
               <button
+                id="detail-tab-chat"
+                role="tab"
+                aria-selected={view === "chat"}
+                aria-controls="detail-tabpanel"
                 className={view === "chat" ? "active" : ""}
                 onClick={() => setView("chat")}
               >
                 <MessageCircle size={16} /> Ask this lecture
               </button>
               <button
+                id="detail-tab-transcript"
+                role="tab"
+                aria-selected={view === "transcript"}
+                aria-controls="detail-tabpanel"
                 className={view === "transcript" ? "active" : ""}
                 onClick={onTranscript}
               >
                 <AudioLines size={16} /> Transcript
               </button>
             </div>
-            {view === "notes" && <NotesView notes={lecture.notes} />}
-            {view === "chat" && (
-              <ChatView
-                lectureId={lecture.id}
-                userInitial={userInitial}
-                sessions={sessions}
-                active={active}
-                messages={messages}
-                onCreate={onCreate}
-                onChoose={onChoose}
-                setMessages={setMessages}
-                onSeek={onSeek}
-              />
-            )}
-            {view === "transcript" && (
-              <div className="transcript-panel">
-                <div className="panel-title">
-                  <div>
-                    <span className="eyebrow">FROM THE RECORDING</span>
-                    <h2>Lecture transcript</h2>
-                  </div>
-                  <span className="transcript-readonly">
-                    <Check size={14} /> Source transcript
-                  </span>
-                </div>
-                <pre>{transcript || "Loading transcript…"}</pre>
-              </div>
-            )}
+            <div
+              id="detail-tabpanel"
+              role="tabpanel"
+              aria-labelledby={`detail-tab-${view}`}
+              tabIndex={0}
+            >
+              {view === "notes" && (
+            <NotesView
+              notes={lecture.notes}
+              onAskAbout={(question) => {
+                setChatDraft(question);
+                setView("chat");
+              }}
+            />
+              )}
+              {view === "chat" && (
+            <ChatView
+              lectureId={lecture.id}
+              userInitial={userInitial}
+              notes={lecture.notes}
+              draftQuestion={chatDraft}
+              onDraftConsumed={() => setChatDraft("")}
+              sessions={sessions}
+              active={active}
+              messages={messages}
+              onCreate={onCreate}
+              onChoose={onChoose}
+              onDeleteChat={onDeleteChat}
+              setMessages={setMessages}
+              onSeek={onSeek}
+              activeSourceKey={activeSourceKey}
+            />
+              )}
+              {view === "transcript" && (
+            <TranscriptView
+              lectureId={lecture.id}
+              currentTime={audioTime}
+              onSeek={onSeek}
+              transcript={transcript}
+            />
+              )}
+            </div>
           </div>
           <aside className="detail-aside">
             <div className="aside-card">
@@ -2052,21 +2298,35 @@ function LectureView({
             <div className="aside-card chat-history-card">
               <div className="history-heading">
                 <span className="eyebrow">CHAT HISTORY</span>
-                <button title="Start a new chat" onClick={onCreate}>
+                <button
+                  type="button"
+                  title="Start a new chat"
+                  aria-label="Start a new chat"
+                  onClick={onCreate}
+                >
                   <Plus size={16} />
                 </button>
               </div>
               {sessions.length ? (
                 sessions.map((chat) => (
-                  <button
-                    key={chat.id}
-                    className={`history-item ${active?.id === chat.id ? "current" : ""}`}
-                    onClick={() => onChoose(chat)}
-                  >
-                    <MessageCircle size={15} />
-                    <span>{chat.title}</span>
-                    <ArrowRight size={13} />
-                  </button>
+                  <div className="history-item-row" key={chat.id}>
+                    <button
+                      className={`history-item ${active?.id === chat.id ? "current" : ""}`}
+                      onClick={() => onChoose(chat)}
+                    >
+                      <MessageCircle size={15} />
+                      <span>{chat.title}</span>
+                      <ArrowRight size={13} />
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-btn history-delete"
+                      aria-label={`Delete chat ${chat.title}`}
+                      onClick={() => onDeleteChat(chat)}
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
                 ))
               ) : (
                 <p className="history-empty">
@@ -2081,7 +2341,171 @@ function LectureView({
   );
 }
 
-function NotesView({ notes }: { notes?: Notes }) {
+function TranscriptView({
+  lectureId,
+  currentTime,
+  onSeek,
+  transcript,
+}: {
+  lectureId: string;
+  currentTime: number;
+  onSeek: (startSeconds: number, endSeconds?: number) => void;
+  transcript: string;
+}) {
+  const [segments, setSegments] = useState<TranscriptSegment[]>([]);
+  const [search, setSearch] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const listRef = useRef<HTMLDivElement>(null);
+  const activeRowRef = useRef<HTMLDivElement>(null);
+  const manuallyScrolled = useRef(false);
+  const programmaticScroll = useRef(false);
+
+  useEffect(() => {
+    let active = true;
+    setSegments([]);
+    setError("");
+    setLoading(true);
+    api<TranscriptSegment[]>(`/lectures/${lectureId}/segments`)
+      .then((rows) => {
+        if (active) setSegments(rows);
+      })
+      .catch((reason) => {
+        if (active) setError(userFacingError(reason));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [lectureId]);
+
+  const activeIndex = segments.findIndex(
+    (segment) => currentTime >= segment.start && currentTime < segment.end,
+  );
+  useEffect(() => {
+    const list = listRef.current;
+    const row = activeRowRef.current;
+    if (!list || !row || activeIndex < 0 || manuallyScrolled.current) return;
+    programmaticScroll.current = true;
+    list.scrollTo({
+      top: row.offsetTop - list.offsetTop - list.clientHeight / 2 + row.clientHeight / 2,
+      behavior: "smooth",
+    });
+    const timer = window.setTimeout(() => {
+      programmaticScroll.current = false;
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [activeIndex]);
+
+  function highlight(text: string) {
+    const value = search.trim();
+    if (!value) return text;
+    const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return text.split(new RegExp(`(${escaped})`, "ig")).map((part, index) =>
+      part.toLowerCase() === value.toLowerCase() ? (
+        <mark key={`${part}-${index}`}>{part}</mark>
+      ) : (
+        part
+      ),
+    );
+  }
+
+  return (
+    <div className="transcript-panel">
+      <div className="panel-title">
+        <div>
+          <span className="eyebrow">FROM THE RECORDING</span>
+          <h2>Lecture transcript</h2>
+        </div>
+        <span className="transcript-readonly">
+          <Check size={14} /> Source transcript
+        </span>
+      </div>
+      <label className="transcript-search">
+        <Search size={16} aria-hidden="true" />
+        <input
+          type="search"
+          value={search}
+          onChange={(event) => {
+            setSearch(event.target.value);
+            manuallyScrolled.current = false;
+          }}
+          placeholder="Search transcript"
+          aria-label="Search transcript"
+        />
+      </label>
+      {error ? (
+        <p className="transcript-error" role="alert">{error}</p>
+      ) : (
+        <div
+          className="transcript-list"
+          ref={listRef}
+          onScroll={() => {
+            if (!programmaticScroll.current) manuallyScrolled.current = true;
+          }}
+          onWheel={() => {
+            manuallyScrolled.current = true;
+          }}
+          onTouchMove={() => {
+            manuallyScrolled.current = true;
+          }}
+          onKeyDown={(event) => {
+            if (["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End"].includes(event.key))
+              manuallyScrolled.current = true;
+          }}
+          tabIndex={0}
+          aria-label="Transcript segments"
+        >
+          {segments.length ? (
+            (() => {
+              const rows = segments
+              .map((segment, index) => ({ segment, index }))
+              .filter(({ segment }) =>
+                segment.text.toLowerCase().includes(search.trim().toLowerCase()),
+              );
+              return rows.length ? rows.map(({ segment, index }) => (
+                <div
+                  key={`${segment.start}-${segment.end}`}
+                  ref={activeIndex === index ? activeRowRef : null}
+                  className={`transcript-segment ${activeIndex === index ? "playing" : ""}`}
+                >
+                  <button
+                    type="button"
+                    className="transcript-time"
+                    onClick={() => {
+                      manuallyScrolled.current = false;
+                      onSeek(segment.start, segment.end);
+                    }}
+                    aria-label={`Play from ${formatSourceTime(segment.start)}`}
+                  >
+                    {formatSourceTime(segment.start)}
+                  </button>
+                  <p>{highlight(segment.text)}</p>
+                </div>
+              )) : <p className="transcript-empty">No matching segments.</p>;
+            })()
+          ) : loading ? (
+            <p className="transcript-empty">Loading transcript segments…</p>
+          ) : transcript ? (
+            <pre className="transcript-legacy">{highlight(transcript)}</pre>
+          ) : (
+            <p className="transcript-empty">No transcript segments are available.</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NotesView({
+  notes,
+  onAskAbout,
+}: {
+  notes?: Notes;
+  onAskAbout: (question: string) => void;
+}) {
   if (!notes)
     return (
       <div className="empty-library">
@@ -2094,11 +2518,25 @@ function NotesView({ notes }: { notes?: Notes }) {
       <div className="notes-intro">
         <span className="eyebrow">LECTURE SUMMARY</span>
         <p>{notes.summary}</p>
+        <div className="note-section-actions">
+          <button
+            type="button"
+            className="note-action"
+            onClick={() => onAskAbout("Summarize this lecture in simpler terms.")}
+          >
+            <MessageCircle size={13} /> Ask about this
+          </button>
+        </div>
       </div>
       <NoteSection
         title="Core explanations"
         tone="blue"
         icon={<BookOpen size={17} />}
+        onAsk={() =>
+          onAskAbout(
+            `Explain these lecture concepts: ${notes.core_explanations.map((item) => item.topic).join(", ") || "the core ideas"}.`,
+          )
+        }
       >
         {notes.core_explanations.length ? (
           notes.core_explanations.map((topic, index) => (
@@ -2122,6 +2560,7 @@ function NotesView({ notes }: { notes?: Notes }) {
         title="Exam-relevant points"
         tone="rose"
         icon={<Sparkles size={17} />}
+        onAsk={() => onAskAbout("Help me understand the exam-relevant points from this lecture.")}
       >
         {notes.exam_points.length ? (
           notes.exam_points.map((item, index) => (
@@ -2138,6 +2577,7 @@ function NotesView({ notes }: { notes?: Notes }) {
         title="Announcements"
         tone="amber"
         icon={<Clock3 size={17} />}
+        onAsk={() => onAskAbout("Explain the announcements and deadlines from this lecture.")}
       >
         {notes.announcements.length ? (
           notes.announcements.map((item, index) => (
@@ -2154,6 +2594,7 @@ function NotesView({ notes }: { notes?: Notes }) {
         title="Off-topic remarks"
         tone="green"
         icon={<MessageCircle size={17} />}
+        onAsk={() => onAskAbout("What off-topic remarks were mentioned in this lecture?")}
       >
         {notes.off_topic.length ? (
           notes.off_topic.map((item, index) => (
@@ -2174,19 +2615,52 @@ function NoteSection({
   tone,
   icon,
   children,
+  onAsk,
 }: {
   title: string;
   tone: string;
   icon: ReactNode;
   children: ReactNode;
+  onAsk: () => void;
 }) {
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "error">("idle");
+  async function copySection() {
+    try {
+      await navigator.clipboard.writeText(
+        `${title}\n${contentRef.current?.innerText || ""}`,
+      );
+      setCopyState("copied");
+      window.setTimeout(() => setCopyState("idle"), 1400);
+    } catch {
+      setCopyState("error");
+    }
+  }
   return (
     <section className={`note-section ${tone}`}>
       <div className="note-section-title">
         <span>{icon}</span>
         <h2>{title}</h2>
+        <div className="note-section-actions">
+          <button type="button" className="note-action" onClick={onAsk}>
+            <MessageCircle size={13} /> Ask about this
+          </button>
+          <button
+            type="button"
+            className="note-action"
+            onClick={() => void copySection()}
+            aria-label={`Copy ${title}`}
+          >
+            <Copy size={13} />
+            {copyState === "copied"
+              ? "Copied"
+              : copyState === "error"
+                ? "Copy failed"
+                : "Copy section"}
+          </button>
+        </div>
       </div>
-      {children}
+      <div ref={contentRef}>{children}</div>
     </section>
   );
 }
@@ -2194,31 +2668,109 @@ function NoteSection({
 function ChatView({
   lectureId,
   userInitial,
+  notes,
+  draftQuestion,
+  onDraftConsumed,
   sessions,
   active,
   messages,
   onCreate,
   onChoose,
+  onDeleteChat,
   setMessages,
   onSeek,
+  activeSourceKey,
 }: {
   lectureId: string;
   userInitial: string;
+  notes?: Notes;
+  draftQuestion: string;
+  onDraftConsumed: () => void;
   sessions: ChatSession[];
   active: ChatSession | null;
   messages: ChatMessage[];
   onCreate: () => void;
   onChoose: (session: ChatSession, loadMessages?: boolean) => void;
+  onDeleteChat: (session: ChatSession) => void;
   setMessages: Dispatch<SetStateAction<ChatMessage[]>>;
-  onSeek: (startSeconds: number) => void;
+  onSeek: (startSeconds: number, endSeconds?: number) => void;
+  activeSourceKey: string;
 }) {
   const [question, setQuestion] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const [showHistory, setShowHistory] = useState(false);
+  const [copiedMessageId, setCopiedMessageId] = useState<number | null>(null);
+  const historyMenuRef = useRef<HTMLDivElement>(null);
+  const historyButtonRef = useRef<HTMLButtonElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const stickToBottom = useRef(true);
   const hasPendingReply = messages.some(
     (message) => message.role === "assistant" && message.status === "pending",
   );
+  useEffect(() => {
+    if (!draftQuestion) return;
+    setQuestion(draftQuestion);
+    onDraftConsumed();
+    textareaRef.current?.focus();
+  }, [draftQuestion, onDraftConsumed]);
+  const suggestions = useMemo(() => {
+    const fromNotes = [
+      ...(notes?.core_explanations.slice(0, 2).map(
+        (item) => `Explain ${item.topic} simply.`,
+      ) || []),
+      ...(notes?.exam_points.slice(0, 1).map(
+        (item) => `Help me understand this exam point: ${item.point}`,
+      ) || []),
+    ];
+    const fallbacks = [
+      "What should I focus on for the exam?",
+      "Explain the main idea simply",
+      "Where does the lecture discuss its key example?",
+    ];
+    return [...fromNotes, ...fallbacks].slice(0, 3);
+  }, [notes]);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    const lineHeight = Number.parseFloat(
+      window.getComputedStyle(textarea).lineHeight,
+    );
+    const maxHeight = (Number.isFinite(lineHeight) ? lineHeight : 20) * 6;
+    textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`;
+    textarea.style.overflowY =
+      textarea.scrollHeight > maxHeight ? "auto" : "hidden";
+  }, [question]);
+
+  useEffect(() => {
+    const list = messagesRef.current;
+    if (list && stickToBottom.current) list.scrollTop = list.scrollHeight;
+  }, [messages]);
+  useEffect(() => {
+    if (!showHistory) return;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (
+        event.target instanceof Node &&
+        !historyMenuRef.current?.contains(event.target)
+      )
+        setShowHistory(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setShowHistory(false);
+        historyButtonRef.current?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [showHistory]);
   useEffect(() => {
     if (!active || !hasPendingReply) return;
     let cancelled = false;
@@ -2251,9 +2803,8 @@ function ChatView({
     };
   }, [active, hasPendingReply, setMessages]);
 
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    const text = question.trim();
+  async function sendQuestion(text: string, acceptOffer = false) {
+    text = text.trim();
     if (!text || sending) return;
     let chat = active;
     const temporaryId = -Date.now();
@@ -2287,7 +2838,11 @@ function ChatView({
         assistant_message: ChatMessage;
       }>(`/lectures/${lectureId}/chat`, {
         method: "POST",
-        body: JSON.stringify({ session_id: chat.id, message: text }),
+        body: JSON.stringify({
+          session_id: chat.id,
+          message: text,
+          accept_offer: acceptOffer,
+        }),
       });
       setMessages((current) => [
         ...current.filter(
@@ -2316,6 +2871,20 @@ function ChatView({
       setSending(false);
     }
   }
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    void sendQuestion(question);
+  }
+
+  async function copyMessage(message: ChatMessage) {
+    try {
+      await navigator.clipboard.writeText(message.content);
+      setCopiedMessageId(message.id);
+      window.setTimeout(() => setCopiedMessageId(null), 1400);
+    } catch (reason) {
+      setError(userFacingError(reason));
+    }
+  }
   return (
     <div className="chat-panel">
       <div className="chat-panel-head">
@@ -2324,34 +2893,63 @@ function ChatView({
           <h2>{active?.title || "Ask anything from class"}</h2>
         </div>
         <div className="chat-head-actions">
-          <button
-            className="button button-outline compact"
-            onClick={() => setShowHistory(!showHistory)}
-          >
-            <Clock3 size={15} /> History <ChevronDown size={14} />
-          </button>
+          <div className="history-menu" ref={historyMenuRef}>
+            <button
+              ref={historyButtonRef}
+              className="button button-outline compact history-toggle"
+              onClick={() => setShowHistory((value) => !value)}
+              aria-expanded={showHistory}
+              aria-haspopup="true"
+            >
+              <Clock3 size={15} /> History <ChevronDown size={14} />
+            </button>
+            {showHistory && (
+              <div className="chat-history-dropdown">
+                {sessions.map((chat) => (
+                  <div className="history-item-row" key={chat.id}>
+                    <button
+                      onClick={() => {
+                        onChoose(chat);
+                        setShowHistory(false);
+                      }}
+                    >
+                      <MessageCircle size={15} />
+                      <span>{chat.title}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-btn history-delete"
+                      aria-label={`Delete chat ${chat.title}`}
+                      onClick={() => {
+                        onDeleteChat(chat);
+                        setShowHistory(false);
+                      }}
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
           <button className="button button-outline compact" onClick={onCreate}>
             <Plus size={15} /> New chat
           </button>
         </div>
       </div>
-      {showHistory && (
-        <div className="chat-history-dropdown">
-          {sessions.map((chat) => (
-            <button
-              key={chat.id}
-              onClick={() => {
-                onChoose(chat);
-                setShowHistory(false);
-              }}
-            >
-              <MessageCircle size={15} />
-              {chat.title}
-            </button>
-          ))}
-        </div>
-      )}
-      <div className="chat-messages">
+      <div
+        className="chat-messages"
+        role="log"
+        aria-live="polite"
+        aria-relevant="additions text"
+        aria-label="Chat messages"
+        ref={messagesRef}
+        onScroll={(event) => {
+          const element = event.currentTarget;
+          stickToBottom.current =
+            element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+        }}
+      >
         {!messages.length && (
           <div className="chat-welcome">
             <span>
@@ -2363,20 +2961,27 @@ function ChatView({
               recording.
             </p>
             <div className="prompt-suggestions">
-              {[
-                "What should I focus on for the exam?",
-                "Explain the main idea simply",
-                "Where does the lecture discuss its key example?",
-              ].map((text) => (
-                <button key={text} onClick={() => setQuestion(text)}>
+              {suggestions.map((text) => (
+                <button
+                  key={text}
+                  onClick={() => {
+                    setQuestion(text);
+                    textareaRef.current?.focus();
+                  }}
+                >
                   {text} <ArrowRight size={14} />
                 </button>
               ))}
             </div>
           </div>
         )}
-        {messages.map((message) => {
+        {messages.map((message, messageIndex) => {
           const sources = displaySources(message);
+          const isLatest = messageIndex === messages.length - 1;
+          const previousUser = messages
+            .slice(0, messageIndex)
+            .reverse()
+            .find((item) => item.role === "user");
           return (
             <div key={message.id} className={`chat-message ${message.role}`}>
               <span className="message-avatar">
@@ -2396,7 +3001,21 @@ function ChatView({
                     <span />
                   </div>
                 ) : message.role === "assistant" ? (
-                  <ReactMarkdown>{message.content}</ReactMarkdown>
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      pre: ({ children }) => (
+                        <MarkdownCodeBlock>{children}</MarkdownCodeBlock>
+                      ),
+                      table: ({ children }) => (
+                        <div className="markdown-table-wrap">
+                          <table>{children}</table>
+                        </div>
+                      ),
+                    }}
+                  >
+                    {message.content}
+                  </ReactMarkdown>
                 ) : (
                   <p>{message.content}</p>
                 )}
@@ -2405,6 +3024,18 @@ function ChatView({
                   message.grounded === false && (
                     <p className="not-covered-note">
                       Not covered in this lecture
+                    </p>
+                  )}
+                {message.role === "assistant" &&
+                  message.intent === "general" && (
+                    <p className="answer-label general-answer-label">
+                      General answer, not from this lecture
+                    </p>
+                  )}
+                {message.role === "assistant" &&
+                  message.grounded === true && (
+                    <p className="grounded-answer-footer">
+                      Answers are grounded in your lecture
                     </p>
                   )}
                 {sources.length > 0 && (
@@ -2419,18 +3050,61 @@ function ChatView({
                       return (
                         <button
                           type="button"
-                          className="source-chip"
+                          className={`source-chip ${activeSourceKey === `${source.start}-${source.end ?? source.start}` ? "active" : ""}`}
                           key={`${source.start}-${source.end ?? source.start}`}
                           title={source.text_snippet || ""}
                           aria-label={`Jump to ${label}`}
-                          onClick={() => onSeek(source.start ?? 0)}
+                          onClick={() =>
+                            onSeek(source.start ?? 0, source.end)
+                          }
                         >
-                          <Clock3 size={13} /> {label}
+                          <span className="source-chip-title">
+                            <Clock3 size={13} /> {label}
+                          </span>
+                          {source.text_snippet && (
+                            <small className="source-chip-snippet">
+                              {source.text_snippet}
+                            </small>
+                          )}
                         </button>
                       );
                     })}
                   </div>
                 )}
+                {message.role === "assistant" &&
+                  message.status !== "pending" && (
+                    <div className="message-actions">
+                      {message.pending_offer?.type === "general_answer" &&
+                        isLatest && (
+                          <button
+                            type="button"
+                            className="answer-generally-button"
+                            disabled={sending || hasPendingReply}
+                            onClick={() => void sendQuestion("Go ahead", true)}
+                          >
+                            Answer generally
+                          </button>
+                        )}
+                      {message.status === "error" && previousUser && (
+                        <button
+                          type="button"
+                          className="message-action"
+                          onClick={() => void sendQuestion(previousUser.content)}
+                        >
+                          <RotateCcw size={13} /> Retry
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="message-action"
+                        aria-label="Copy assistant answer"
+                        onClick={() => void copyMessage(message)}
+                      >
+                        <Copy size={13} />
+                        {copiedMessageId === message.id ? "Copied" : "Copy"}
+                      </button>
+                    </div>
+                  )}
               </div>
             </div>
           );
@@ -2439,21 +3113,30 @@ function ChatView({
       {error && <div className="chat-error">{error}</div>}
       <form className="chat-composer" onSubmit={submit}>
         <textarea
+          ref={textareaRef}
           value={question}
-          onChange={(event) => setQuestion(event.target.value)}
+          onChange={(event) => {
+            setQuestion(event.target.value);
+            setError("");
+          }}
           onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
+            if (
+              event.key === "Enter" &&
+              !event.shiftKey &&
+              !event.nativeEvent.isComposing
+            ) {
               event.preventDefault();
               event.currentTarget.form?.requestSubmit();
             }
           }}
+          aria-label="Ask a question about this lecture"
           placeholder="Ask a question about this lecture…"
           rows={1}
         />
         <span>
           {hasPendingReply
             ? "Waiting for the previous answer…"
-            : "Answers are grounded in your lecture"}
+            : ""}
         </span>
         <button
           disabled={sending || hasPendingReply || !question.trim()}
@@ -2634,7 +3317,12 @@ function UploadModal({
                 : "Upload an audio recording or bring in a transcript."}
             </p>
           </div>
-          <button className="icon-btn" disabled={busy} onClick={onClose}>
+          <button
+            className="icon-btn"
+            disabled={busy}
+            onClick={onClose}
+            aria-label="Close upload dialog"
+          >
             <X size={19} />
           </button>
         </div>
