@@ -33,6 +33,55 @@ log.setLevel(logging.INFO)
 MAX_UPLOAD_MB = 500
 _processing_tasks: set[asyncio.Task] = set()
 
+API_DESCRIPTION = """
+NotesGraph API for authenticated lecture libraries, transcription, notes,
+timestamp-aware lecture chat, and exports.
+
+## Authentication
+
+Protected `/api` endpoints require a Supabase access token:
+
+`Authorization: Bearer <access_token>`
+
+Use the **Authorize** button in Swagger UI to provide the access token obtained
+from Supabase Auth. Do not use the Supabase publishable key or server secret as
+the bearer token. The API validates the token with Supabase Auth and derives the
+owner ID from the validated user; callers cannot select another owner.
+
+## Lecture processing
+
+Lecture creation and chat generation are asynchronous. Creation returns
+`202 Accepted` with the current lecture/turn state. Poll the lecture detail or
+chat messages endpoint until processing completes. Audio is limited to 500 MiB.
+For browser uploads, first create a lecture using an owner-prefixed private
+Storage path, upload the object to Supabase Storage, and then call
+`/api/lectures/{lecture_id}/start-upload`.
+
+## Chat sources
+
+Source timestamps are built by the API from stored Whisper segment metadata.
+They identify seconds from the beginning of the original recording. Source
+objects may have `start` equal to `end` for a single moment, or an `end` greater
+than `start` for a range. Conversation and general-knowledge answers are not
+lecture-grounded and return no sources.
+
+## Errors
+
+Errors use FastAPI's standard JSON shape, generally `{"detail": "..."}`.
+Protected endpoints return `401` when the bearer token is missing or invalid.
+Resource lookups are owner-scoped; resources not owned by the authenticated
+user are reported as not found.
+"""
+
+OPENAPI_TAGS = [
+    {"name": "System", "description": "Health and deployment configuration endpoints."},
+    {"name": "Subjects", "description": "Create, list, and delete per-user subject folders."},
+    {"name": "Lectures", "description": "Create, inspect, process, retry, reindex, and delete lectures."},
+    {"name": "Transcript", "description": "Retrieve transcript text and timed Whisper segments."},
+    {"name": "Exports", "description": "Download generated lecture notes."},
+    {"name": "Chat", "description": "Manage lecture chat sessions, messages, and grounded answers."},
+]
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -46,7 +95,24 @@ async def lifespan(_: FastAPI):
     log.info("NotesGraph backend stopping (%d processing task(s) active)", len(_processing_tasks))
 
 
-app = FastAPI(title="NotesGraph AI", lifespan=lifespan)
+app = FastAPI(
+    title="NotesGraph AI API",
+    summary="Authenticated lecture processing and timestamp-aware study chat.",
+    description=API_DESCRIPTION,
+    version="1.0.0",
+    openapi_url="/api/openapi.json",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    servers=[
+        {
+            "url": "https://notesgraph-ai.onrender.com",
+            "description": "Production",
+        },
+        {"url": "http://localhost:8000", "description": "Local development"},
+    ],
+    openapi_tags=OPENAPI_TAGS,
+    lifespan=lifespan,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.FRONTEND_ORIGINS,
@@ -425,7 +491,12 @@ def _chat_schema_migration_error() -> HTTPException:
     )
 
 
-@app.get("/api/health")
+@app.get(
+    "/api/health",
+    tags=["System"],
+    summary="Check API health",
+    description="Public deployment health check. Provider fields indicate configured credentials, not whether they are valid.",
+)
 def health():
     log.info("Health check requested")
     return {
@@ -456,17 +527,33 @@ def runtime_config():
     )
 
 
-@app.get("/api/lectures")
+@app.get(
+    "/api/lectures",
+    tags=["Lectures"],
+    summary="List your lectures",
+    description="Returns lecture summaries for the authenticated user, newest first. Transcript, segment, and notes payloads are fetched from the lecture detail route.",
+)
 def list_lectures(user_id: str = Depends(auth.current_user)):
     return store.list_all(user_id)
 
 
-@app.get("/api/folders")
+@app.get(
+    "/api/folders",
+    tags=["Subjects"],
+    summary="List your subjects",
+    description="Returns subject folders belonging to the authenticated user.",
+)
 def list_folders(user_id: str = Depends(auth.current_user)):
     return store.list_folders(user_id)
 
 
-@app.post("/api/folders", status_code=201)
+@app.post(
+    "/api/folders",
+    status_code=201,
+    tags=["Subjects"],
+    summary="Create or reuse a subject",
+    description="Normalizes whitespace and creates a subject folder for the authenticated user. A folder with the same normalized name is reused.",
+)
 def create_folder(payload: FolderCreate, user_id: str = Depends(auth.current_user)):
     name = " ".join(payload.name.split())
     if not name:
@@ -477,7 +564,13 @@ def create_folder(payload: FolderCreate, user_id: str = Depends(auth.current_use
     return folder
 
 
-@app.delete("/api/folders/{folder_id}", status_code=204)
+@app.delete(
+    "/api/folders/{folder_id}",
+    status_code=204,
+    tags=["Subjects"],
+    summary="Delete an empty subject",
+    description="Deletes an owned subject folder only when it contains no lectures. Returns 409 when the folder is not empty.",
+)
 def delete_folder(folder_id: str, user_id: str = Depends(auth.current_user)):
     result = store.delete_folder(user_id, folder_id)
     if result == "not_found":
@@ -490,7 +583,13 @@ def delete_folder(folder_id: str, user_id: str = Depends(auth.current_user)):
     return Response(status_code=204)
 
 
-@app.post("/api/lectures", status_code=202)
+@app.post(
+    "/api/lectures",
+    status_code=202,
+    tags=["Lectures"],
+    summary="Create and process a lecture",
+    description="Accepts an audio upload, a pasted transcript, or metadata for an audio object already uploaded to the private Supabase Storage bucket. Processing runs asynchronously. Direct Storage uploads must set storage_path, source_filename, and defer_processing=true, then call start-upload after the object upload completes. Maximum audio file size is 500 MiB.",
+)
 async def create_lecture(
     file: Optional[UploadFile] = File(None),
     transcript_text: str = Form(""),
@@ -578,7 +677,13 @@ async def create_lecture(
     return meta
 
 
-@app.post("/api/lectures/{lecture_id}/start-upload", status_code=202)
+@app.post(
+    "/api/lectures/{lecture_id}/start-upload",
+    status_code=202,
+    tags=["Lectures"],
+    summary="Start processing an uploaded recording",
+    description="Call after the browser finishes uploading the lecture's audio object to private Supabase Storage. Only lectures awaiting upload can be started.",
+)
 async def start_uploaded_lecture(lecture_id: str, user_id: str = Depends(auth.current_user)):
     meta = _require(lecture_id, user_id)
     if meta["status"] not in ("uploading", "upload_error") or not meta.get("audio_path"):
@@ -590,7 +695,12 @@ async def start_uploaded_lecture(lecture_id: str, user_id: str = Depends(auth.cu
     return updated
 
 
-@app.post("/api/lectures/{lecture_id}/upload-failed")
+@app.post(
+    "/api/lectures/{lecture_id}/upload-failed",
+    tags=["Lectures"],
+    summary="Record an upload failure",
+    description="Persists the failure state for an owned lecture whose audio upload did not complete.",
+)
 def fail_lecture_upload(
     lecture_id: str,
     payload: UploadFailure,
@@ -608,13 +718,23 @@ def fail_lecture_upload(
     )
 
 
-@app.get("/api/lectures/{lecture_id}")
+@app.get(
+    "/api/lectures/{lecture_id}",
+    tags=["Lectures"],
+    summary="Get lecture details",
+    description="Returns the authenticated user's lecture metadata and structured notes when available.",
+)
 def get_lecture(lecture_id: str, user_id: str = Depends(auth.current_user)):
     meta = _require(lecture_id, user_id)
     return {**meta, "notes": store.load_notes(lecture_id, user_id)}
 
 
-@app.get("/api/lectures/{lecture_id}/transcript")
+@app.get(
+    "/api/lectures/{lecture_id}/transcript",
+    tags=["Transcript"],
+    summary="Get transcript text",
+    description="Returns the complete saved transcript as UTF-8 plain text. Use the segments endpoint when timed transcript rows are needed.",
+)
 def get_transcript(lecture_id: str, user_id: str = Depends(auth.current_user)):
     _require(lecture_id, user_id)
     text = store.load_transcript(lecture_id, user_id)
@@ -623,7 +743,12 @@ def get_transcript(lecture_id: str, user_id: str = Depends(auth.current_user)):
     return Response(text, media_type="text/plain; charset=utf-8")
 
 
-@app.get("/api/lectures/{lecture_id}/segments")
+@app.get(
+    "/api/lectures/{lecture_id}/segments",
+    tags=["Transcript"],
+    summary="List timed transcript segments",
+    description="Returns valid {start, end, text} Whisper segments for an owned lecture. Times are seconds relative to the original recording. Word-level timings are not provided.",
+)
 def get_transcript_segments(
     lecture_id: str, user_id: str = Depends(auth.current_user)
 ):
@@ -645,7 +770,12 @@ def get_transcript_segments(
     ]
 
 
-@app.get("/api/lectures/{lecture_id}/notes.pdf")
+@app.get(
+    "/api/lectures/{lecture_id}/notes.pdf",
+    tags=["Exports"],
+    summary="Download notes as PDF",
+    description="Renders the saved structured notes to an A4 PDF. Notes must be ready.",
+)
 def download_pdf(lecture_id: str, user_id: str = Depends(auth.current_user)):
     from .render import notes_to_pdf
 
@@ -661,7 +791,12 @@ def download_pdf(lecture_id: str, user_id: str = Depends(auth.current_user)):
     )
 
 
-@app.get("/api/lectures/{lecture_id}/notes.md")
+@app.get(
+    "/api/lectures/{lecture_id}/notes.md",
+    tags=["Exports"],
+    summary="Download notes as Markdown",
+    description="Renders the saved structured notes as Markdown. Notes must be ready.",
+)
 def download_markdown(lecture_id: str, user_id: str = Depends(auth.current_user)):
     from .render import notes_to_markdown
 
@@ -677,7 +812,13 @@ def download_markdown(lecture_id: str, user_id: str = Depends(auth.current_user)
     )
 
 
-@app.post("/api/lectures/{lecture_id}/retry", status_code=202)
+@app.post(
+    "/api/lectures/{lecture_id}/retry",
+    status_code=202,
+    tags=["Lectures"],
+    summary="Retry lecture processing",
+    description="Requeues a failed lecture when its stored audio or transcript is available.",
+)
 async def retry_lecture(
     lecture_id: str, user_id: str = Depends(auth.current_user)
 ):
@@ -703,7 +844,13 @@ async def retry_lecture(
     return updated
 
 
-@app.post("/api/lectures/{lecture_id}/retry-index", status_code=202)
+@app.post(
+    "/api/lectures/{lecture_id}/retry-index",
+    status_code=202,
+    tags=["Lectures"],
+    summary="Retry failed chat indexing",
+    description="Rebuilds vector chunks from saved transcript data after an indexing failure; does not retranscribe the audio or regenerate notes.",
+)
 async def retry_index(lecture_id: str, user_id: str = Depends(auth.current_user)):
     meta = _require(lecture_id, user_id)
     if meta["status"] != "index_error":
@@ -711,7 +858,13 @@ async def retry_index(lecture_id: str, user_id: str = Depends(auth.current_user)
     return _schedule_indexing(lecture_id, user_id, "Retrying chat indexing")
 
 
-@app.post("/api/lectures/{lecture_id}/reindex", status_code=202)
+@app.post(
+    "/api/lectures/{lecture_id}/reindex",
+    status_code=202,
+    tags=["Lectures"],
+    summary="Reindex a lecture",
+    description="Rebuilds the vector index from saved transcript and Whisper segment data without retranscription. Completed or indexing-error lectures with saved segments are required.",
+)
 async def reindex_lecture(lecture_id: str, user_id: str = Depends(auth.current_user)):
     meta = _require(lecture_id, user_id)
     if meta["status"] not in ("done", "index_error"):
@@ -726,7 +879,12 @@ async def reindex_lecture(lecture_id: str, user_id: str = Depends(auth.current_u
     return _schedule_indexing(lecture_id, user_id, "Rebuilding citation index")
 
 
-@app.get("/api/chat-sessions")
+@app.get(
+    "/api/chat-sessions",
+    tags=["Chat"],
+    summary="List chat sessions",
+    description="Lists the authenticated user's chat sessions. Optionally filter by an owned lecture_id.",
+)
 def list_chat_sessions(
     lecture_id: Optional[str] = None, user_id: str = Depends(auth.current_user)
 ):
@@ -735,13 +893,25 @@ def list_chat_sessions(
     return store.list_chat_sessions(user_id, lecture_id)
 
 
-@app.post("/api/lectures/{lecture_id}/chat-sessions", status_code=201)
+@app.post(
+    "/api/lectures/{lecture_id}/chat-sessions",
+    status_code=201,
+    tags=["Chat"],
+    summary="Create a chat session",
+    description="Creates a persistent chat session belonging to the authenticated user and the specified owned lecture.",
+)
 def create_chat_session(lecture_id: str, user_id: str = Depends(auth.current_user)):
     _require(lecture_id, user_id)
     return store.create_chat_session(user_id, lecture_id)
 
 
-@app.get("/api/chat-sessions/{session_id}/messages", response_model=list[ChatMessage])
+@app.get(
+    "/api/chat-sessions/{session_id}/messages",
+    response_model=list[ChatMessage],
+    tags=["Chat"],
+    summary="List messages in a chat",
+    description="Returns ordered messages, including sources, intent, grounding, pending offers, and processing status. Stale pending replies may be marked as errors when read.",
+)
 def get_chat_messages(session_id: str, user_id: str = Depends(auth.current_user)):
     if store.get_chat_session(session_id, user_id) is None:
         raise HTTPException(404, "Chat session not found")
@@ -753,7 +923,14 @@ def get_chat_messages(session_id: str, user_id: str = Depends(auth.current_user)
         raise
 
 
-@app.post("/api/lectures/{lecture_id}/chat", status_code=202, response_model=ChatTurn)
+@app.post(
+    "/api/lectures/{lecture_id}/chat",
+    status_code=202,
+    response_model=ChatTurn,
+    tags=["Chat"],
+    summary="Ask a question about a lecture",
+    description="Persists the user question and a pending assistant message, then generates the answer asynchronously. Poll the chat messages endpoint until the assistant status is complete or error. Conversation/general answers are not lecture-grounded and have no source chips. Set accept_offer=true to accept the immediately preceding general-answer offer.",
+)
 async def chat(
     lecture_id: str, req: ChatRequest, user_id: str = Depends(auth.current_user)
 ):
@@ -814,7 +991,13 @@ async def chat(
     return {"user_message": user_message, "assistant_message": assistant_message}
 
 
-@app.delete("/api/chat-sessions/{session_id}/messages", status_code=204)
+@app.delete(
+    "/api/chat-sessions/{session_id}/messages",
+    status_code=204,
+    tags=["Chat"],
+    summary="Clear chat messages",
+    description="Deletes all messages from an owned chat session while retaining the session itself.",
+)
 def reset_chat(session_id: str, user_id: str = Depends(auth.current_user)):
     if store.get_chat_session(session_id, user_id) is None:
         raise HTTPException(404, "Chat session not found")
@@ -825,7 +1008,13 @@ def reset_chat(session_id: str, user_id: str = Depends(auth.current_user)):
     return Response(status_code=204)
 
 
-@app.delete("/api/chat-sessions/{session_id}", status_code=204)
+@app.delete(
+    "/api/chat-sessions/{session_id}",
+    status_code=204,
+    tags=["Chat"],
+    summary="Delete a chat session",
+    description="Deletes an owned chat session and its messages.",
+)
 def delete_chat(session_id: str, user_id: str = Depends(auth.current_user)):
     if not store.delete_chat_session(session_id, user_id):
         raise HTTPException(404, "Chat session not found")
@@ -835,7 +1024,13 @@ def delete_chat(session_id: str, user_id: str = Depends(auth.current_user)):
     return Response(status_code=204)
 
 
-@app.delete("/api/lectures/{lecture_id}", status_code=204)
+@app.delete(
+    "/api/lectures/{lecture_id}",
+    status_code=204,
+    tags=["Lectures"],
+    summary="Delete a lecture",
+    description="Deletes the authenticated user's lecture and cascading database records, removes its private audio object, and clears process-local chat history.",
+)
 def delete_lecture(lecture_id: str, user_id: str = Depends(auth.current_user)):
     _require(lecture_id, user_id)
     from .rag import clear_lecture_history

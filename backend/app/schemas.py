@@ -51,45 +51,108 @@ class Notes(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    session_id: str = Field(min_length=1, max_length=100)
-    message: str = Field(min_length=1, max_length=4000)
-    accept_offer: bool = False
+    session_id: str = Field(
+        min_length=1,
+        max_length=100,
+        description="ID of the persistent chat session associated with this lecture.",
+    )
+    message: str = Field(
+        min_length=1,
+        max_length=4000,
+        description="The user's message. Context-dependent follow-ups are rewritten internally; the original message is stored.",
+    )
+    accept_offer: bool = Field(
+        default=False,
+        description="Explicitly accept a pending general-answer offer from the previous assistant message.",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "session_id": "f6c955d6-1f12-4f97-880f-071d96946e3b",
+                    "message": "Where does the speaker explain deadlock prevention?",
+                    "accept_offer": False,
+                }
+            ]
+        }
+    }
 
 
 class PendingOffer(BaseModel):
-    type: Literal["general_answer"]
-    question: str
+    type: Literal["general_answer"] = Field(
+        description="The only currently supported offer type."
+    )
+    question: str = Field(
+        description="Standalone question stored by the backend for a later general answer."
+    )
 
 
 class ChatSource(BaseModel):
-    start: Optional[float] = None
-    end: Optional[float] = None
-    timestamp_label: Optional[str] = None
-    text_snippet: Optional[str] = None
+    start: Optional[float] = Field(
+        default=None,
+        description="Source start in seconds from the beginning of the original recording.",
+    )
+    end: Optional[float] = Field(
+        default=None,
+        description="Source end in seconds. Equal to start for a single moment; greater than start for a range.",
+    )
+    timestamp_label: Optional[str] = Field(
+        default=None,
+        description="Human-readable time or time range, formatted as mm:ss or hh:mm:ss.",
+    )
+    text_snippet: Optional[str] = Field(
+        default=None,
+        description="Transcript excerpt associated with this source. It is not word-level timing data.",
+    )
 
 
 class ChatMessage(BaseModel):
-    id: int
-    role: Literal["user", "assistant"]
-    content: str
-    created_at: str
-    sources: List[ChatSource] = Field(default_factory=list)
-    status: Optional[Literal["pending", "complete", "error"]] = None
+    id: int = Field(description="Persisted message identifier and ordering key.")
+    role: Literal["user", "assistant"] = Field(description="Whether this row is a user or assistant message.")
+    content: str = Field(description="Message text; pending assistant messages may have empty content.")
+    created_at: str = Field(description="Database creation timestamp.")
+    sources: List[ChatSource] = Field(
+        default_factory=list,
+        description="Server-built lecture sources. Empty for ungrounded, conversation, and general answers.",
+    )
+    status: Optional[Literal["pending", "complete", "error"]] = Field(
+        default=None,
+        description="Asynchronous assistant reply state.",
+    )
     intent: Optional[
         Literal["locate", "explain", "off_topic", "conversation", "general"]
-    ] = None
-    grounded: Optional[bool] = None
-    pending_offer: Optional[PendingOffer] = None
+    ] = Field(default=None, description="Router-selected answer intent.")
+    grounded: Optional[bool] = Field(
+        default=None,
+        description="Whether the answer is supported by retrieved lecture excerpts.",
+    )
+    pending_offer: Optional[PendingOffer] = Field(
+        default=None,
+        description="General-answer offer which can be explicitly accepted in the next turn.",
+    )
 
 
 class ChatTurn(BaseModel):
-    user_message: ChatMessage
-    assistant_message: ChatMessage
+    user_message: ChatMessage = Field(description="Persisted user message.")
+    assistant_message: ChatMessage = Field(
+        description="Persisted assistant placeholder. Poll the session messages endpoint for completion."
+    )
 
 
 class FolderCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
+    name: str = Field(
+        min_length=1,
+        max_length=100,
+        description="Subject folder name; whitespace is normalized and matching owner folders are reused.",
+        examples=["Operating Systems"],
+    )
 
 
 class UploadFailure(BaseModel):
-    error: str = Field(min_length=1, max_length=500)
+    error: str = Field(
+        min_length=1,
+        max_length=500,
+        description="Short explanation of the failed audio upload.",
+        examples=["The connection to storage was interrupted."],
+    )

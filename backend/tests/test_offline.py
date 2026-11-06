@@ -34,6 +34,38 @@ def test_schema_roundtrip():
     assert "title" in Notes.model_json_schema()["properties"]
 
 
+def test_swagger_documentation_exposes_authenticated_api_contract():
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    assert client.get("/api/docs").status_code == 200
+    assert client.get("/api/redoc").status_code == 200
+
+    response = client.get("/api/openapi.json")
+    assert response.status_code == 200
+    schema = response.json()
+    assert schema["info"]["title"] == "NotesGraph AI API"
+    assert schema["servers"][0] == {
+        "url": "https://notesgraph-ai.onrender.com",
+        "description": "Production",
+    }
+    assert schema["components"]["securitySchemes"]["HTTPBearer"] == {
+        "type": "http",
+        "scheme": "bearer",
+    }
+    protected_operations = [
+        operation
+        for path, methods in schema["paths"].items()
+        if path.startswith("/api/") and path != "/api/health"
+        for method, operation in methods.items()
+        if method in {"get", "post", "put", "patch", "delete"}
+    ]
+    assert protected_operations
+    assert all(operation.get("security") for operation in protected_operations)
+    assert "/api/lectures/{lecture_id}/chat" in schema["paths"]
+
+
 def test_render_markdown_and_pdf():
     from app.render import notes_to_markdown, notes_to_pdf
     md = notes_to_markdown(SAMPLE)
