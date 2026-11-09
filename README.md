@@ -1,16 +1,79 @@
 # NotesGraph AI
 
-Turn a lecture recording into structured notes, organize them by subject, and ask timestamp-aware questions about the lecture.
+Turn lecture recordings into clear, searchable study materials. NotesGraph AI transcribes lectures, creates structured notes, organizes them by subject, and lets you ask questions grounded in what was actually said.
+
+## How it works
+
+1. Upload a lecture recording or paste an existing transcript.
+2. NotesGraph transcribes audio and keeps timestamps for each segment.
+3. AI-generated notes summarize the lecture and surface exam-relevant points, announcements, and off-topic remarks.
+4. Review the transcript, search your notes, or ask questions and jump to cited moments in the recording.
+5. Export your notes as PDF or Markdown.
 
 ## Features
 
-- Supabase Auth email/password sign-up and sign-in, with protected application routes.
-- Owner-scoped lectures, folders, private audio objects, notes, vector retrieval, chat sessions, and messages.
-- Audio transcription with Whisper segment timestamps; answers cite the matching audio time when available.
-- Subject folders are reused per account. Blank titles are generated from the lecture's specific topic.
-- Audio uploads use resumable transfers directly to private Supabase Storage and can resume from the last saved chunk after a network interruption. If TUS loses its connection on a file smaller than 6 MiB, the browser may retry it as a direct Storage upload; larger files remain resumable rather than retrying as one large request. Note processing starts in the background after the upload completes. Temporary embedding outages use bounded retries; if indexing still fails, notes remain available and chat indexing can be retried separately.
-- React, TypeScript, Tailwind CSS, Motion animations, and persistent light/dark themes.
-- FastAPI backend with Gemini note generation and Supabase pgvector retrieval.
+- Create an account and keep lectures, audio, transcripts, notes, and chats private to your workspace.
+- Organize lectures in reusable subject folders, with titles generated from lecture content when needed.
+- Upload audio with resumable transfers to private Supabase Storage; processing continues in the background after upload.
+- Get timestamped transcripts and structured notes, including summaries, key concepts, exam-relevant material, announcements, and off-topic remarks.
+- Ask lecture-specific questions with answers grounded in transcript passages and timestamps; out-of-scope questions are identified.
+- Search transcripts and export study notes as PDF or Markdown.
+- Use a responsive interface with persistent light and dark themes.
+
+## Tech stack
+
+| Area | Technologies |
+|---|---|
+| Frontend | React, TypeScript, Vite, Tailwind CSS, Motion, Lucide |
+| Backend | Python, FastAPI, Uvicorn |
+| AI and speech | Google Gemini for notes, chat, and embeddings; Groq Whisper for transcription |
+| Data and authentication | Supabase Auth, PostgreSQL, Row Level Security, private Supabase Storage, pgvector |
+| Uploads and exports | tus-js-client resumable uploads, ReportLab PDF generation, Markdown export |
+| Deployment | Docker, Render |
+
+## Screenshots
+
+### Getting started
+
+<table>
+  <tr>
+    <td width="50%"><img src="screenshots/home-page.png" alt="NotesGraph AI landing page" width="460"><br><strong>Landing page</strong></td>
+    <td width="50%"><img src="screenshots/account-creation.png" alt="Create a NotesGraph account" width="460"><br><strong>Account creation</strong></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="screenshots/add-lecture.png" alt="Add a lecture by uploading audio or pasting a transcript" width="460"><br><strong>Add a lecture</strong></td>
+    <td width="50%"><img src="screenshots/upload-progress.png" alt="Lecture audio uploading in the library" width="460"><br><strong>Upload progress</strong></td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="screenshots/lecture-library.png" alt="Lecture library with a processed lecture organized by subject" width="920"><br><strong>Lecture library and subject organization</strong></td>
+  </tr>
+</table>
+
+### Lecture workspace
+
+<table>
+  <tr>
+    <td width="50%"><img src="screenshots/transcript-view.png" alt="Timestamped lecture transcript with audio player" width="460"><br><strong>Timestamped transcript</strong></td>
+    <td width="50%"><img src="screenshots/study-notes.png" alt="AI-generated lecture summary and study notes" width="460"><br><strong>Study notes</strong></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="screenshots/structured-study-notes.png" alt="Study notes grouped into exam-relevant points, announcements, and off-topic remarks" width="460"><br><strong>Structured notes and exam highlights</strong></td>
+    <td width="50%"><img src="screenshots/pdf-export.png" alt="Lecture study notes exported as a PDF" width="460"><br><strong>PDF export</strong></td>
+  </tr>
+</table>
+
+### Ask your lecture
+
+<table>
+  <tr>
+    <td width="50%"><img src="screenshots/grounded-lecture-chat.png" alt="Lecture-grounded answer with a timestamped source passage" width="460"><br><strong>Grounded answer with a timestamp</strong></td>
+    <td width="50%"><img src="screenshots/out-of-scope-chat.png" alt="A question outside the lecture is identified as not covered" width="460"><br><strong>Out-of-scope question handling</strong></td>
+  </tr>
+</table>
+
+### API reference
+
+<p align="center"><img src="screenshots/api-reference.png" alt="Interactive FastAPI documentation for NotesGraph endpoints" width="900"></p>
 
 ## Project layout
 
@@ -90,4 +153,3 @@ Backend settings are read from the project-root `.env`:
 
 Supabase persists lecture records, transcript text and segments, notes, subject folders, private audio files, chat sessions, and chat messages. The pgvector table stores lecture excerpts with owner and lecture IDs; retrieval always filters by both. Audio uploads are limited to 500 MB.
 
-Existing data under the previous local `data/` directory is left untouched, but is not automatically assigned to an account or imported. It has no authenticated owner mapping, so re-upload the recordings or transcripts after signing in. The old local data is not deleted.
